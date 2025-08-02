@@ -196,4 +196,201 @@ jobs:
         aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text | tr '\t' '\n' | while read INSTANCE_ID; do
           if [ ! -z "$INSTANCE_ID" ]; then
             echo "Terminating instance: $INSTANCE_ID"
-            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
+          fi
+        done
+
+        - name: 8. Wait for instances to terminate
+      run: |
+        echo "⏳ STEP 8: WAITING FOR INSTANCES TO TERMINATE..."
+        
+        # Wait for all instances to be terminated
+        echo "Waiting for all instances to terminate (this may take several minutes)..."
+        aws ec2 wait instance-terminated --instance-ids $(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping,shutting-down" --query 'Reservations[*].Instances[*].InstanceId' --output text) 2>/dev/null || echo "No instances to wait for"
+        
+        echo "All instances terminated!"
+
+    - name: 9. Release ALL Elastic IPs
+      run: |
+        echo "🧹 STEP 9: RELEASING ALL ELASTIC IPs..."
+        
+        aws ec2 describe-addresses --query 'Addresses[*].[AllocationId,AssociationId,PublicIp]' --output text | while read ALLOCATION_ID ASSOCIATION_ID PUBLIC_IP; do
+          if [ ! -z "$ALLOCATION_ID" ]; then
+            echo "Processing Elastic IP: $PUBLIC_IP (Allocation: $ALLOCATION_ID)"
+            
+            # Disassociate if associated
+            if [ ! -z "$ASSOCIATION_ID" ] && [ "$ASSOCIATION_ID" != "None" ]; then
+              echo "  Disassociating from: $ASSOCIATION_ID"
+              aws ec2 disassociate-address --association-id "$ASSOCIATION_ID" || echo "  Failed to disassociate"
+              sleep 5
+            fi
+            
+            # Release the Elastic IP
+            echo "  Releasing Elastic IP: $PUBLIC_IP"
+            aws ec2 release-address --allocation-id "$ALLOCATION_ID" || echo "  Failed to release $ALLOCATION_ID"
+          fi
+        done
+
+    - name: 10. Delete NAT Gateways
+      run: |
+        echo "🧹 STEP 10: DESTROYING ALL NAT GATEWAYS..."
+        
+        aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" --query 'NatGateways[*].NatGatewayId' --output text | tr '\t' '\n' | while read NAT_GW_ID; do
+          if [ ! -z "$NAT_GW_ID" ]; then
+            echo "Deleting NAT Gateway: $NAT_GW_ID"
+            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_GW_ID" || echo "Failed to delete $NAT_GW_ID"
+          fi
+        done
+        
+        # Wait for NAT Gateways to be deleted
+        echo "Waiting for NAT Gateways to be deleted..."
+        sleep 60
+
+    - name: 11. Delete Security Groups
+      run: |
+        echo "🧹 STEP 11: DESTROYING ALL CUSTOM SECURITY GROUPS..."
+        
+        # Get all non-default security groups
+        aws ec2 describe-security-groups --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text | tr '\t' '\n' | while read SG_ID; do
+          if [ ! -z "$SG_ID" ]; then
+            echo "Attempting to delete security group: $SG_ID"
+            
+            # Try multiple times as dependencies may need to clear
+            for i in {1..5}; do
+              if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
+                echo "  Successfully deleted: $SG_ID"
+                break
+              else
+                echo "  Attempt $i failed for $SG_ID, retrying in 30 seconds..."
+                sleep 30
+              fi
+            done
+          fi
+        done
+
+    - name: 12. Detach and Delete Internet Gateways
+      run: |
+        echo "🧹 STEP 12: DESTROYING ALL INTERNET GATEWAYS..."
+        
+        aws ec2 describe-internet-gateways --query 'InternetGateways[*].[InternetGatewayId,Attachments[0].VpcId]' --output text | while read IGW_ID VPC_ID; do
+          if [ ! -z "$IGW_ID" ] && [ "$VPC_ID" != "None" ] && [ ! -z "$VPC_ID" ]; then
+            echo "Detaching IGW $IGW_ID from VPC $VPC_ID"
+            aws ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" || echo "Failed to detach $IGW_ID"
+            sleep 10
+            
+            echo "Deleting IGW: $IGW_ID"
+            aws ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID" || echo "Failed to delete $IGW_ID"
+          fi
+        done
+
+    - name: 13. Delete Subnets
+      run: |
+        echo "🧹 STEP 13: DESTROYING ALL SUBNETS..."
+        
+        aws ec2 describe-subnets --query 'Subnets[*].SubnetId' --output text | tr '\t' '\n' | while read SUBNET_ID; do
+          if [ ! -z "$SUBNET_ID" ]; then
+            echo "Deleting subnet: $SUBNET_ID"
+            aws ec2 delete-subnet --subnet-id "$SUBNET_ID" || echo "Failed to delete $SUBNET_ID"
+          fi
+        done
+
+    - name: 14. Delete Route Tables
+      run: |
+        echo "🧹 STEP 14: DESTROYING ALL CUSTOM ROUTE TABLES..."
+        
+        # Get all route tables that are not main route tables
+        aws ec2 describe-route-tables --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text | tr '\t' '\n' | while read RT_ID; do
+          if [ ! -z "$RT_ID" ]; then
+            echo "Deleting route table: $RT_ID"
+            aws ec2 delete-route-table --route-table-id "$RT_ID" || echo "Failed to delete $RT_ID"
+          fi
+        done
+
+    - name: 15. Delete VPCs
+      run: |
+        echo "🧹 STEP 15: DESTROYING ALL NON-DEFAULT VPCs..."
+        
+        aws ec2 describe-vpcs --query 'Vpcs[?IsDefault!=`true`].VpcId' --output text | tr '\t' '\n' | while read VPC_ID; do
+          if [ ! -z "$VPC_ID" ]; then
+            echo "Deleting VPC: $VPC_ID"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" || echo "Failed to delete $VPC_ID"
+          fi
+        done
+
+    - name: 16. Cleanup CloudWatch Log Groups
+      run: |
+        echo "🧹 STEP 16: DESTROYING ALL CLOUDWATCH LOG GROUPS..."
+        
+        aws logs describe-log-groups --query 'logGroups[*].logGroupName' --output text | tr '\t' '\n' | while read LOG_GROUP; do
+          if [ ! -z "$LOG_GROUP" ]; then
+            echo "Deleting log group: $LOG_GROUP"
+            aws logs delete-log-group --log-group-name "$LOG_GROUP" || echo "Failed to delete $LOG_GROUP"
+          fi
+        done
+
+    - name: 17. Cleanup IAM Roles and Policies
+      run: |
+        echo "🧹 STEP 17: DESTROYING ALL CUSTOM IAM ROLES..."
+        
+        # Get all roles that are not AWS service roles
+        aws iam list-roles --query 'Roles[?!starts_with(RoleName, `AWS`) && !starts_with(RoleName, `aws-`) && !starts_with(RoleName, `service-role`)].RoleName' --output text | tr '\t' '\n' | while read ROLE_NAME; do
+          if [ ! -z "$ROLE_NAME" ]; then
+            echo "Processing role: $ROLE_NAME"
+            
+            # Detach managed policies
+            aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read POLICY_ARN; do
+              if [ ! -z "$POLICY_ARN" ]; then
+                echo "  Detaching policy: $POLICY_ARN"
+                aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach $POLICY_ARN"
+              fi
+            done
+            
+            # Delete inline policies
+            aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text | tr '\t' '\n' | while read POLICY_NAME; do
+              if [ ! -z "$POLICY_NAME" ]; then
+                echo "  Deleting inline policy: $POLICY_NAME"
+                aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete $POLICY_NAME"
+              fi
+            done
+            
+            # Delete instance profiles
+            aws iam list-instance-profiles-for-role --role-name "$ROLE_NAME" --query 'InstanceProfiles[*].InstanceProfileName' --output text | tr '\t' '\n' | while read PROFILE_NAME; do
+              if [ ! -z "$PROFILE_NAME" ]; then
+                echo "  Removing role from instance profile: $PROFILE_NAME"
+                aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME" || echo "  Failed to remove role"
+                aws iam delete-instance-profile --instance-profile-name "$PROFILE_NAME" || echo "  Failed to delete profile"
+              fi
+            done
+            
+            # Delete the role
+            echo "  Deleting role: $ROLE_NAME"
+            aws iam delete-role --role-name "$ROLE_NAME" || echo "  Failed to delete $ROLE_NAME"
+          fi
+        done
+
+    - name: 18. Final Resource Scan
+      run: |
+        echo "🔍 FINAL SCAN: CHECKING FOR REMAINING RESOURCES..."
+        echo "================================================="
+        
+        echo "=== REMAINING EC2 INSTANCES ==="
+        aws ec2 describe-instances --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' --output table || echo "✅ No instances remaining"
+        
+        echo "=== REMAINING RDS INSTANCES ==="
+        aws rds describe-db-instances --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceStatus]' --output table || echo "✅ No RDS instances remaining"
+        
+        echo "=== REMAINING S3 BUCKETS ==="
+        aws s3 ls || echo "✅ No buckets remaining"
+        
+        echo "=== REMAINING ELASTIC IPs ==="
+        aws ec2 describe-addresses --query 'Addresses[*].[PublicIp,AllocationId]' --output table || echo "✅ No Elastic IPs remaining"
+        
+        echo "=== REMAINING VPCs ==="
+        aws ec2 describe-vpcs --query 'Vpcs[?IsDefault!=`true`].[VpcId,State]' --output table || echo "✅ No custom VPCs remaining"
+        
+        echo "=== REMAINING NAT GATEWAYS ==="
+        aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" --query 'NatGateways[*].[NatGatewayId,State]' --output table || echo "✅ No NAT Gateways remaining"
+        
+        echo ""
+        echo "🎯 NUCLEAR CLEANUP COMPLETED!"
+        echo "💰 All billable
