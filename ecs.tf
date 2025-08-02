@@ -148,3 +148,36 @@ resource "aws_ecs_task_definition" "geojson_processor" {
     null_resource.docker_build_and_push
   ]
 }
+
+# ECS Service
+resource "aws_ecs_service" "geojson_processor" {
+  name            = "geojson-processor-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.geojson_processor.arn
+  desired_count   = 0  # Start with 0, will be managed by Lambda triggers
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = module.vpc.private_subnets
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = false
+  }
+
+  # Don't wait for steady state since this is triggered by Lambda
+  wait_for_steady_state = false
+
+  # Allow external changes to desired count (Lambda will manage this)
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  tags = {
+    Name = "GeoJSON Processor Service"
+  }
+}
+
+# Output the service name for reference
+output "ecs_service_name" {
+  description = "Name of the ECS service"
+  value       = aws_ecs_service.geojson_processor.name
+}
