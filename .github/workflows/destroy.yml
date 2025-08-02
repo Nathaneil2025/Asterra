@@ -197,6 +197,9 @@ jobs:
           if [ ! -z "$INSTANCE_ID" ]; then
             echo "Terminating instance: $INSTANCE_ID"
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 92224bc13436dc44ebbe7dfc9b036d150a3c3b6c
             aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
           fi
         done
@@ -395,6 +398,9 @@ jobs:
         echo ""
         echo "🎯 NUCLEAR CLEANUP COMPLETED!"
         echo "💰 All billable
+<<<<<<< HEAD
 =======
             aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $
 >>>>>>> c1521aed28e6f0aa99eb0b277bbbb41534d1b975
+=======
+>>>>>>> 92224bc13436dc44ebbe7dfc9b036d150a3c3b6c
