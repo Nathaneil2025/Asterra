@@ -1,9 +1,6 @@
 terraform {
-  # backend "s3" {
-  #   bucket = "my-terraform-state-bucket"
-  #   key    = "terraform.tfstate"
-  #   region = "eu-central-1"
-  # }
+  # Backend configuration is now in backend.tf
+  # No backend configuration here to avoid duplicates
 }
 
 variable "db_password" {
