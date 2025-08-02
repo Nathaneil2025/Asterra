@@ -196,15 +196,11 @@ jobs:
         aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text | tr '\t' '\n' | while read INSTANCE_ID; do
           if [ ! -z "$INSTANCE_ID" ]; then
             echo "Terminating instance: $INSTANCE_ID"
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 92224bc13436dc44ebbe7dfc9b036d150a3c3b6c
             aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
           fi
         done
 
-        - name: 8. Wait for instances to terminate
+    - name: 8. Wait for instances to terminate
       run: |
         echo "⏳ STEP 8: WAITING FOR INSTANCES TO TERMINATE..."
         
@@ -261,7 +257,7 @@ jobs:
             
             # Try multiple times as dependencies may need to clear
             for i in {1..5}; do
-              if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
+                            if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
                 echo "  Successfully deleted: $SG_ID"
                 break
               else
@@ -362,6 +358,7 @@ jobs:
               if [ ! -z "$PROFILE_NAME" ]; then
                 echo "  Removing role from instance profile: $PROFILE_NAME"
                 aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME" || echo "  Failed to remove role"
+                echo "  Deleting instance profile: $PROFILE_NAME"
                 aws iam delete-instance-profile --instance-profile-name "$PROFILE_NAME" || echo "  Failed to delete profile"
               fi
             done
@@ -372,13 +369,13 @@ jobs:
           fi
         done
 
-    - name: 18. Final Resource Scan
+    - name: 18. Final Resource Verification
       run: |
-        echo "🔍 FINAL SCAN: CHECKING FOR REMAINING RESOURCES..."
-        echo "================================================="
+        echo "🔍 FINAL VERIFICATION - CHECKING FOR REMAINING RESOURCES..."
+        echo "============================================================"
         
         echo "=== REMAINING EC2 INSTANCES ==="
-        aws ec2 describe-instances --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' --output table || echo "✅ No instances remaining"
+        aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping,pending" --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' --output table || echo "✅ No instances remaining"
         
         echo "=== REMAINING RDS INSTANCES ==="
         aws rds describe-db-instances --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceStatus]' --output table || echo "✅ No RDS instances remaining"
@@ -392,15 +389,19 @@ jobs:
         echo "=== REMAINING VPCs ==="
         aws ec2 describe-vpcs --query 'Vpcs[?IsDefault!=`true`].[VpcId,State]' --output table || echo "✅ No custom VPCs remaining"
         
-        echo "=== REMAINING NAT GATEWAYS ==="
-        aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" --query 'NatGateways[*].[NatGatewayId,State]' --output table || echo "✅ No NAT Gateways remaining"
+        echo "=== REMAINING LAMBDA FUNCTIONS ==="
+        aws lambda list-functions --query 'Functions[*].FunctionName' --output table || echo "✅ No Lambda functions remaining"
+        
+        echo "=== REMAINING ECR REPOSITORIES ==="
+        aws ecr describe-repositories --query 'repositories[*].repositoryName' --output table || echo "✅ No ECR repositories remaining"
+        
+        echo "=== REMAINING ECS CLUSTERS ==="
+        aws ecs list-clusters --query 'clusterArns' --output table || echo "✅ No ECS clusters remaining"
         
         echo ""
         echo "🎯 NUCLEAR CLEANUP COMPLETED!"
-        echo "💰 All billable
-<<<<<<< HEAD
-=======
-            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $
->>>>>>> c1521aed28e6f0aa99eb0b277bbbb41534d1b975
-=======
->>>>>>> 92224bc13436dc44ebbe7dfc9b036d150a3c3b6c
+        echo "============================================"
+        echo "⚠️  WARNING: This was a complete destruction of ALL AWS resources!"
+        echo "📊 Please review the verification output above to confirm cleanup"
+        echo "💰 Check your AWS billing to ensure no unexpected charges"
+        echo "🔄 You may need to wait a few minutes for all deletions to propagate"
