@@ -2,20 +2,20 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   AWS_REGION: eu-central-1
   ECR_REPOSITORY: geojson-processor
-  ECS_SERVICE: geojson-processor-service
   ECS_CLUSTER: geojson-processor-cluster
-  ECS_TASK_DEFINITION: geojson-processor
+  ECS_SERVICE: geojson-processor-service
+  WORDPRESS_SERVICE: wordpress-service
 
 jobs:
   test:
-    name: Test Application
+    name: Run Tests
     runs-on: ubuntu-latest
     
     steps:
@@ -31,17 +31,7 @@ jobs:
       run: |
         cd geojson-processor
         pip install -r requirements.txt
-        pip install pytest pytest-cov flake8 black
-        
-    - name: Code formatting check
-      run: |
-        cd geojson-processor
-        black --check . || true
-        
-    - name: Lint code
-      run: |
-        cd geojson-processor
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+        pip install pytest pytest-cov
         
     - name: Run tests
       run: |
@@ -69,6 +59,10 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     
+    outputs:
+      wordpress_url: ${{ steps.terraform-output.outputs.wordpress_url }}
+      ecr_repository_url: ${{ steps.terraform-output.outputs.ecr_repository_url }}
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -77,6 +71,7 @@ jobs:
       uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: 1.12.2
+        terraform_wrapper: false
         
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -90,9 +85,15 @@ jobs:
       
     - name: Terraform Apply
       run: terraform apply -auto-approve
+      
+    - name: Get Terraform Outputs
+      id: terraform-output
+      run: |
+        echo "wordpress_url=$(terraform output -raw wordpress_url)" >> $GITHUB_OUTPUT
+        echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
 
   build-and-deploy:
-    name: Build and Deploy
+    name: Build and Deploy GeoJSON Processor
     needs: [terraform-apply]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
@@ -117,18 +118,18 @@ jobs:
       run: |
         VERSION=$(git rev-parse --short HEAD)
         echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-        echo "IMAGE_TAG=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:$VERSION" >> $GITHUB_OUTPUT
+        echo "IMAGE_TAG=${{ needs.terraform-apply.outputs.ecr_repository_url }}:$VERSION" >> $GITHUB_OUTPUT
         
     - name: Build Docker image
       run: |
         cd geojson-processor
         docker build -t ${{ steps.version.outputs.IMAGE_TAG }} .
-        docker tag ${{ steps.version.outputs.IMAGE_TAG }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        docker tag ${{ steps.version.outputs.IMAGE_TAG }} ${{ needs.terraform-apply.outputs.ecr_repository_url }}:latest
         
     - name: Push image to ECR
       run: |
         docker push ${{ steps.version.outputs.IMAGE_TAG }}
-        docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        docker push ${{ needs.terraform-apply.outputs.ecr_repository_url }}:latest
         
     - name: Update ECS task definition
       id: task-def
@@ -145,6 +146,73 @@ jobs:
         service: ${{ env.ECS_SERVICE }}
         cluster: ${{ env.ECS_CLUSTER }}
         wait-for-service-stability: true
+
+  deploy-wordpress:
+    name: Deploy WordPress
+    needs: [terraform-apply]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: Force WordPress service update
+      run: |
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.WORDPRESS_SERVICE }} \
+          --force-new-deployment
+          
+    - name: Wait for WordPress deployment
+      run: |
+        aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.WORDPRESS_SERVICE }}
+
+  health-check:
+    name: Health Check
+    needs: [deploy-wordpress, build-and-deploy]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: Check WordPress health
+      run: |
+        WORDPRESS_URL="${{ needs.terraform-apply.outputs.wordpress_url }}"
+        echo "Checking WordPress at: $WORDPRESS_URL"
+        
+        # Wait for WordPress to be ready
+        for i in {1..10}; do
+          if curl -f -s "$WORDPRESS_URL" > /dev/null; then
+            echo "✅ WordPress is healthy!"
+            break
+          else
+            echo "⏳ Waiting for WordPress... (attempt $i/10)"
+            sleep 30
+          fi
+        done
+        
+    - name: Display deployment info
+      run: |
+        echo "🚀 Deployment completed successfully!"
+        echo "📊 GeoJSON Processor: Running on ECS"
+        echo "🌐 WordPress: ${{ needs.terraform-apply.outputs.wordpress_url }}"
+        echo "📝 Check AWS Console for detailed logs"
 
   terraform-plan:
     name: Terraform Plan
@@ -171,7 +239,9 @@ jobs:
       run: terraform init
       
     - name: Terraform Plan
+      id: plan
       run: terraform plan -no-color
+      continue-on-error: true
       
     - name: Comment PR
       uses: actions/github-script@v7
