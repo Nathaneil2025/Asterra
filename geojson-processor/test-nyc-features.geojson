@@ -1,0 +1,55 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Central Park",
+        "city": "New York",
+        "type": "park",
+        "area_hectares": 341
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-73.9812, 40.7681],
+          [-73.9581, 40.7681],
+          [-73.9581, 40.7831],
+          [-73.9812, 40.7831],
+          [-73.9812, 40.7681]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Times Square",
+        "city": "New York",
+        "type": "landmark",
+        "visitors_per_year": 50000000
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-73.9857, 40.7589]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Brooklyn Bridge",
+        "city": "New York",
+        "type": "bridge",
+        "length_meters": 1825,
+        "opened": 1883
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-73.9969, 40.7061],
+          [-73.9939, 40.7033],
+          [-73.9903, 40.7028]
+        ]
+      }
+    }
+  ]
+}

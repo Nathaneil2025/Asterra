@@ -1,0 +1,71 @@
+# Terraform files
+.terraform/
+.terraform.*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+
+# Terraform provider binaries
+.terraform/providers/
+
+# AWS credentials
+.aws/credentials
+.aws/config
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+.dockerignore
+
+# Secrets
+*.pem
+*.key
+secrets.txt
