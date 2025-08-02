@@ -142,25 +142,69 @@ jobs:
           fi
         done
 
-    - name: 5. Cleanup Load Balancers
+    - name: 5. Cleanup Load Balancers and Target Groups
       run: |
-        echo "🧹 STEP 5: DESTROYING ALL LOAD BALANCERS..."
+        echo "🧹 STEP 5: DESTROYING ALL LOAD BALANCERS AND TARGET GROUPS..."
         
-        # Application Load Balancers
-        aws elbv2 describe-load-balancers --query 'LoadBalancers[*].LoadBalancerArn' --output text | tr '\t' '\n' | while read ALB_ARN; do
+        # Delete Application Load Balancers (ALBs) and Network Load Balancers (NLBs)
+        echo "--- Deleting Application/Network Load Balancers ---"
+        aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerArn,LoadBalancerName,Type]' --output text | while read ALB_ARN ALB_NAME ALB_TYPE; do
           if [ ! -z "$ALB_ARN" ]; then
-            echo "Deleting ALB: $ALB_ARN"
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" || echo "Failed to delete ALB"
+            echo "Deleting $ALB_TYPE Load Balancer: $ALB_NAME ($ALB_ARN)"
+            
+            # First, delete all listeners
+            aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query 'Listeners[*].ListenerArn' --output text | tr '\t' '\n' | while read LISTENER_ARN; do
+              if [ ! -z "$LISTENER_ARN" ]; then
+                echo "  Deleting listener: $LISTENER_ARN"
+                aws elbv2 delete-listener --listener-arn "$LISTENER_ARN" || echo "  Failed to delete listener"
+              fi
+            done
+            
+            # Delete the load balancer
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" || echo "Failed to delete ALB: $ALB_NAME"
+            sleep 5
           fi
         done
         
-        # Classic Load Balancers
+        # Delete Classic Load Balancers (ELBs)
+        echo "--- Deleting Classic Load Balancers ---"
         aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text | tr '\t' '\n' | while read ELB_NAME; do
           if [ ! -z "$ELB_NAME" ]; then
             echo "Deleting Classic ELB: $ELB_NAME"
-            aws elb delete-load-balancer --load-balancer-name "$ELB_NAME" || echo "Failed to delete ELB"
+            aws elb delete-load-balancer --load-balancer-name "$ELB_NAME" || echo "Failed to delete ELB: $ELB_NAME"
+            sleep 5
           fi
         done
+        
+        # Wait for load balancers to be deleted before proceeding with target groups
+        echo "--- Waiting for load balancers to be deleted ---"
+        sleep 30
+        
+        # Delete Target Groups (after load balancers are deleted)
+        echo "--- Deleting Target Groups ---"
+        aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupArn,TargetGroupName]' --output text | while read TG_ARN TG_NAME; do
+          if [ ! -z "$TG_ARN" ]; then
+            echo "Deleting Target Group: $TG_NAME ($TG_ARN)"
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN" || echo "Failed to delete Target Group: $TG_NAME"
+            sleep 2
+          fi
+        done
+        
+        # Verify cleanup
+        echo "--- Verifying Load Balancer Cleanup ---"
+        REMAINING_ALBS=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
+        REMAINING_ELBS=$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
+        REMAINING_TGS=$(aws elbv2 describe-target-groups --query 'TargetGroups[*].TargetGroupName' --output text 2>/dev/null | wc -w)
+        
+        echo "Remaining ALB/NLBs: $REMAINING_ALBS"
+        echo "Remaining Classic ELBs: $REMAINING_ELBS"
+        echo "Remaining Target Groups: $REMAINING_TGS"
+        
+        if [ "$REMAINING_ALBS" -eq 0 ] && [ "$REMAINING_ELBS" -eq 0 ] && [ "$REMAINING_TGS" -eq 0 ]; then
+          echo "✅ All load balancers and target groups successfully deleted!"
+        else
+          echo "⚠️  Some load balancers or target groups may still be deleting..."
+        fi
 
     - name: 6. Cleanup S3 Buckets
       run: |
@@ -369,7 +413,7 @@ jobs:
           fi
         done
 
-    - name: 18. Final Resource Verification
+        - name: 18. Final Resource Verification
       run: |
         echo "🔍 FINAL VERIFICATION - CHECKING FOR REMAINING RESOURCES..."
         echo "============================================================"
@@ -379,6 +423,26 @@ jobs:
         
         echo "=== REMAINING RDS INSTANCES ==="
         aws rds describe-db-instances --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceStatus]' --output table || echo "✅ No RDS instances remaining"
+        
+        echo "=== REMAINING LOAD BALANCERS ==="
+        ALB_COUNT=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
+        ELB_COUNT=$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
+        if [ "$ALB_COUNT" -eq 0 ] && [ "$ELB_COUNT" -eq 0 ]; then
+          echo "✅ No load balancers remaining"
+        else
+          echo "⚠️  Found $ALB_COUNT ALB/NLBs and $ELB_COUNT Classic ELBs still remaining"
+          aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerName,Type,State.Code]' --output table 2>/dev/null || true
+          aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].[LoadBalancerName,Scheme]' --output table 2>/dev/null || true
+        fi
+        
+        echo "=== REMAINING TARGET GROUPS ==="
+        TG_COUNT=$(aws elbv2 describe-target-groups --query 'TargetGroups[*].TargetGroupName' --output text 2>/dev/null | wc -w)
+        if [ "$TG_COUNT" -eq 0 ]; then
+          echo "✅ No target groups remaining"
+        else
+          echo "⚠️  Found $TG_COUNT target groups still remaining"
+          aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupName,Protocol,Port]' --output table 2>/dev/null || true
+        fi
         
         echo "=== REMAINING S3 BUCKETS ==="
         aws s3 ls || echo "✅ No buckets remaining"
@@ -405,3 +469,4 @@ jobs:
         echo "📊 Please review the verification output above to confirm cleanup"
         echo "💰 Check your AWS billing to ensure no unexpected charges"
         echo "🔄 You may need to wait a few minutes for all deletions to propagate"
+        echo "🔄 Load balancers may take up to 5-10 minutes to fully delete"
