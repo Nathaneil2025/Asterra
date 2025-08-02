@@ -196,6 +196,7 @@ jobs:
         aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text | tr '\t' '\n' | while read INSTANCE_ID; do
           if [ ! -z "$INSTANCE_ID" ]; then
             echo "Terminating instance: $INSTANCE_ID"
+<<<<<<< HEAD
             aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
           fi
         done
@@ -394,3 +395,6 @@ jobs:
         echo ""
         echo "🎯 NUCLEAR CLEANUP COMPLETED!"
         echo "💰 All billable
+=======
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $
+>>>>>>> c1521aed28e6f0aa99eb0b277bbbb41534d1b975
