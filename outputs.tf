@@ -1,11 +1,12 @@
+
 output "rds_endpoint" {
   description = "RDS instance endpoint"
   value       = aws_db_instance.postgres.endpoint
 }
 
-output "s3_bucket_name" {
-  description = "Name of the S3 bucket"
-  value       = aws_s3_bucket.private_bucket.bucket
+output "geojson_bucket_name" {
+  description = "Name of the GeoJSON S3 bucket"
+  value       = aws_s3_bucket.geojson_data.bucket
 }
 
 output "bastion_public_ip" {
@@ -36,11 +37,6 @@ output "vpc_id" {
 output "private_subnet_ids" {
   description = "The IDs of the private subnets"
   value       = module.vpc.private_subnets
-}
-
-output "docker_build_status" {
-  description = "Status of Docker build and push"
-  value = var.docker_build_enabled ? "Docker image built and pushed automatically" : "Docker build disabled"
 }
 
 output "ecr_image_uri" {

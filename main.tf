@@ -41,7 +41,6 @@ resource "aws_security_group" "rds" {
   }
 }
 
-
 # Add security group rule to allow ECS to access RDS
 resource "aws_security_group_rule" "rds_from_ecs" {
   type                     = "ingress"
@@ -84,13 +83,14 @@ resource "aws_db_subnet_group" "private" {
   subnet_ids = module.vpc.private_subnets
 }
 
-resource "aws_s3_bucket" "private_bucket" {
-  bucket        = "my-private-bucket-${random_string.bucket_suffix.result}"
+# GeoJSON Data Bucket (this is what your app uses)
+resource "aws_s3_bucket" "geojson_data" {
+  bucket        = "asterra-geojson-data-${random_string.bucket_suffix.result}"
   force_destroy = true
 }
 
-resource "aws_s3_bucket_public_access_block" "private_bucket" {
-  bucket = aws_s3_bucket.private_bucket.id
+resource "aws_s3_bucket_public_access_block" "geojson_data" {
+  bucket = aws_s3_bucket.geojson_data.id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -136,8 +136,8 @@ resource "aws_iam_role_policy" "s3_access" {
         ]
         Effect = "Allow"
         Resource = [
-          aws_s3_bucket.private_bucket.arn,
-          "${aws_s3_bucket.private_bucket.arn}/*"
+          aws_s3_bucket.geojson_data.arn,
+          "${aws_s3_bucket.geojson_data.arn}/*"
         ]
       }
     ]
@@ -195,9 +195,6 @@ resource "aws_instance" "bastion" {
   }
 }
 
-
-
-
 resource "aws_iam_role_policy" "ecs_task_s3_policy" {
   name = "ecs-task-s3-policy"
   role = aws_iam_role.ecs_task_role.id
@@ -212,8 +209,8 @@ resource "aws_iam_role_policy" "ecs_task_s3_policy" {
           "s3:ListBucket"
         ]
         Resource = [
-          aws_s3_bucket.private_bucket.arn,
-          "${aws_s3_bucket.private_bucket.arn}/*"
+          aws_s3_bucket.geojson_data.arn,
+          "${aws_s3_bucket.geojson_data.arn}/*"
         ]
       }
     ]
@@ -282,7 +279,7 @@ resource "aws_iam_role_policy" "lambda_ecs_s3_policy" {
         Action = [
           "s3:GetObject"
         ]
-        Resource = "${aws_s3_bucket.private_bucket.arn}/*"
+        Resource = "${aws_s3_bucket.geojson_data.arn}/*"
       }
     ]
   })
@@ -319,7 +316,7 @@ resource "aws_lambda_function" "s3_trigger" {
 
 # S3 bucket notification
 resource "aws_s3_bucket_notification" "geojson_notification" {
-  bucket = aws_s3_bucket.private_bucket.id
+  bucket = aws_s3_bucket.geojson_data.id
 
   lambda_function {
     lambda_function_arn = aws_lambda_function.s3_trigger.arn
@@ -336,6 +333,5 @@ resource "aws_lambda_permission" "allow_s3" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.s3_trigger.function_name
   principal     = "s3.amazonaws.com"
-  source_arn    = aws_s3_bucket.private_bucket.arn
+  source_arn    = aws_s3_bucket.geojson_data.arn
 }
-

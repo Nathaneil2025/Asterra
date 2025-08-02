@@ -1,19 +1,27 @@
-# Security Group for ECS Tasks (moved up to avoid dependency issues)
+
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = "geojson-processor-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = {
+    Name = "Main ECS Cluster"
+  }
+}
+
+# Security Group for ECS Tasks
 resource "aws_security_group" "ecs_tasks" {
   name        = "ecs-tasks-security-group"
   description = "Security group for ECS tasks"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = [module.vpc.vpc_cidr_block]
-  }
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
+    from_port   = 5000
+    to_port     = 5000
     protocol    = "tcp"
     cidr_blocks = [module.vpc.vpc_cidr_block]
   }
@@ -30,21 +38,15 @@ resource "aws_security_group" "ecs_tasks" {
   }
 }
 
-# ECS Cluster
-resource "aws_ecs_cluster" "main" {
-  name = "geojson-processor-cluster"
-
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
-  }
-}
-
 # CloudWatch Log Group for ECS
 resource "aws_cloudwatch_log_group" "ecs_logs" {
   name              = "/ecs/geojson-processor"
   retention_in_days = 7
   skip_destroy      = false
+
+  tags = {
+    Name = "ECS Logs"
+  }
 }
 
 # ECS Execution Role
@@ -88,7 +90,7 @@ resource "aws_iam_role" "ecs_task_role" {
   })
 }
 
-# ECS task definition
+# ECS Task Definition
 resource "aws_ecs_task_definition" "geojson_processor" {
   family                   = "geojson-processor"
   network_mode             = "awsvpc"
@@ -129,6 +131,10 @@ resource "aws_ecs_task_definition" "geojson_processor" {
         {
           name  = "DB_PASSWORD"
           value = var.db_password
+        },
+        {
+          name  = "GEOJSON_BUCKET"
+          value = aws_s3_bucket.geojson_data.bucket
         }
       ]
 
@@ -140,13 +146,23 @@ resource "aws_ecs_task_definition" "geojson_processor" {
           "awslogs-stream-prefix" = "ecs"
         }
       }
+
+      portMappings = [
+        {
+          containerPort = 5000
+          protocol      = "tcp"
+        }
+      ]
     }
   ])
 
   depends_on = [
-    aws_cloudwatch_log_group.ecs_logs,
-    null_resource.docker_build_and_push
+    aws_cloudwatch_log_group.ecs_logs
   ]
+
+  tags = {
+    Name = "GeoJSON Processor Task Definition"
+  }
 }
 
 # ECS Service
@@ -174,10 +190,4 @@ resource "aws_ecs_service" "geojson_processor" {
   tags = {
     Name = "GeoJSON Processor Service"
   }
-}
-
-# Output the service name for reference
-output "ecs_service_name" {
-  description = "Name of the ECS service"
-  value       = aws_ecs_service.geojson_processor.name
 }
