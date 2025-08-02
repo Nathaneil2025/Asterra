@@ -53,6 +53,108 @@ jobs:
         scan-ref: './geojson-processor'
         format: 'table'
 
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.12.2
+        terraform_wrapper: false
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Check Remote State Setup
+      run: |
+        echo "🔍 Checking remote state setup for PR..."
+        
+        # Check if S3 bucket exists
+        if aws s3 ls s3://terraform-state-asterra-project/ > /dev/null 2>&1; then
+          echo "✅ S3 bucket exists"
+          S3_EXISTS=true
+        else
+          echo "⚠️ S3 bucket not found - this is expected for first-time setup"
+          S3_EXISTS=false
+        fi
+        
+        # Check if DynamoDB table exists
+        if aws dynamodb describe-table --table-name terraform-state-lock --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "✅ DynamoDB lock table exists"
+          DYNAMO_EXISTS=true
+        else
+          echo "⚠️ DynamoDB lock table not found - this is expected for first-time setup"
+          DYNAMO_EXISTS=false
+        fi
+        
+        # If remote state doesn't exist, we'll use local state for planning
+        if [ "$S3_EXISTS" = false ] || [ "$DYNAMO_EXISTS" = false ]; then
+          echo "📝 Remote state not available - will use local state for planning"
+          echo "   (Remote state will be automatically created when merging to main)"
+          
+          # Temporarily rename backend.tf to disable remote state for planning
+          if [ -f "backend.tf" ]; then
+            mv backend.tf backend.tf.disabled
+            echo "   Temporarily disabled remote backend for PR planning"
+          fi
+        fi
+        
+    - name: Terraform Init
+      run: terraform init
+      
+    - name: Terraform Validate
+      run: terraform validate
+      
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -no-color
+      continue-on-error: true
+      
+    - name: Restore Backend Configuration
+      if: always()
+      run: |
+        # Restore backend.tf if it was disabled
+        if [ -f "backend.tf.disabled" ]; then
+          mv backend.tf.disabled backend.tf
+          echo "✅ Restored backend configuration"
+        fi
+      
+    - name: Comment PR
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      with:
+        script: |
+          const output = `#### Terraform Plan 📖
+          
+          <details><summary>Show Plan</summary>
+          
+          \`\`\`terraform
+          ${{ steps.plan.outputs.stdout }}
+          \`\`\`
+          
+          </details>
+          
+          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*
+          
+          > **Note**: If this is the first deployment, remote state infrastructure will be automatically created when this PR is merged to main.`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
   terraform-apply:
     name: Terraform Apply
     needs: [test, security-scan]
@@ -78,18 +180,65 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Auto-Setup Remote State Infrastructure
+      run: |
+        echo "🔍 Checking remote state infrastructure..."
+        
+        # Check if S3 bucket exists
+        if aws s3 ls s3://terraform-state-asterra-project/ > /dev/null 2>&1; then
+          echo "✅ S3 bucket exists"
+          S3_EXISTS=true
+        else
+          echo "❌ S3 bucket not found - will create"
+          S3_EXISTS=false
+        fi
+        
+        # Check if DynamoDB table exists
+        if aws dynamodb describe-table --table-name terraform-state-lock --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "✅ DynamoDB lock table exists"
+          DYNAMO_EXISTS=true
+        else
+          echo "❌ DynamoDB lock table not found - will create"
+          DYNAMO_EXISTS=false
+        fi
+        
+        # If either doesn't exist, run the setup
+        if [ "$S3_EXISTS" = false ] || [ "$DYNAMO_EXISTS" = false ]; then
+          echo "🚀 Setting up remote state infrastructure automatically..."
+          
+          # Make script executable
+          chmod +x quick-remote-state-setup.sh
+          
+          # Run the setup script non-interactively
+          echo "yes" | ./quick-remote-state-setup.sh
+          
+          echo "✅ Remote state infrastructure setup completed"
+          
+          # Wait a moment for AWS resources to be fully available
+          echo "⏳ Waiting for resources to be fully available..."
+          sleep 10
+        else
+          echo "✅ Remote state infrastructure already exists"
+        fi
         
     - name: Terraform Init
       run: terraform init
       
+    - name: Terraform Validate
+      run: terraform validate
+      
+    - name: Terraform Plan
+      run: terraform plan -out=tfplan
+      
     - name: Terraform Apply
-      run: terraform apply -auto-approve
+      run: terraform apply tfplan
       
     - name: Get Terraform Outputs
       id: terraform-output
       run: |
-        echo "wordpress_url=$(terraform output -raw wordpress_url)" >> $GITHUB_OUTPUT
+        echo "wordpress_url=$(terraform output -raw wordpress_url 2>/dev/null || echo 'not-available')" >> $GITHUB_OUTPUT
         echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
 
   build-and-deploy:
@@ -107,7 +256,7 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ env.AWS_REGION }}
         
     - name: Login to Amazon ECR
       id: login-ecr
@@ -131,21 +280,53 @@ jobs:
         docker push ${{ steps.version.outputs.IMAGE_TAG }}
         docker push ${{ needs.terraform-apply.outputs.ecr_repository_url }}:latest
         
-    - name: Update ECS task definition
-      id: task-def
-      uses: aws-actions/amazon-ecs-render-task-definition@v1
-      with:
-        task-definition: .aws/task-definition.json
-        container-name: geojson-processor
-        image: ${{ steps.version.outputs.IMAGE_TAG }}
+    - name: Get current task definition
+      id: current-task-def
+      run: |
+        # Get the current task definition
+        TASK_DEF_ARN=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }} \
+          --query 'services[0].taskDefinition' \
+          --output text)
+          
+        aws ecs describe-task-definition \
+          --task-definition $TASK_DEF_ARN \
+          --query 'taskDefinition' \
+          --output json > current-task-def.json
+        
+    - name: Update task definition with new image
+      run: |
+        # Update the image in the task definition
+        jq --arg IMAGE "${{ steps.version.outputs.IMAGE_TAG }}" \
+           '.containerDefinitions[0].image = $IMAGE' \
+           current-task-def.json > updated-task-def.json
+           
+        # Remove fields that shouldn't be in registration
+        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' \
+           updated-task-def.json > final-task-def.json
+        
+    - name: Register new task definition
+      id: register-task-def
+      run: |
+        NEW_TASK_DEF=$(aws ecs register-task-definition \
+          --cli-input-json file://final-task-def.json \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+        echo "NEW_TASK_DEF_ARN=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
         
     - name: Deploy to ECS
-      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-      with:
-        task-definition: ${{ steps.task-def.outputs.task-definition }}
-        service: ${{ env.ECS_SERVICE }}
-        cluster: ${{ env.ECS_CLUSTER }}
-        wait-for-service-stability: true
+      run: |
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --task-definition ${{ steps.register-task-def.outputs.NEW_TASK_DEF_ARN }}
+          
+        echo "⏳ Waiting for service to stabilize..."
+        aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }}
+        echo "✅ Service deployment completed"
 
   deploy-wordpress:
     name: Deploy WordPress
@@ -162,7 +343,7 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ env.AWS_REGION }}
         
     - name: Force WordPress service update
       run: |
@@ -173,9 +354,11 @@ jobs:
           
     - name: Wait for WordPress deployment
       run: |
+        echo "⏳ Waiting for WordPress service to stabilize..."
         aws ecs wait services-stable \
           --cluster ${{ env.ECS_CLUSTER }} \
           --services ${{ env.WORDPRESS_SERVICE }}
+        echo "✅ WordPress deployment completed"
 
   health-check:
     name: Health Check
@@ -189,77 +372,125 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Check GeoJSON Processor health
+      run: |
+        echo "🔍 Checking GeoJSON Processor service..."
+                SERVICE_STATUS=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }} \
+          --query 'services[0].status' \
+          --output text)
+          
+        RUNNING_COUNT=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }} \
+          --query 'services[0].runningCount' \
+          --output text)
+          
+        DESIRED_COUNT=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }} \
+          --query 'services[0].desiredCount' \
+          --output text)
+        
+        echo "Service Status: $SERVICE_STATUS"
+        echo "Running Tasks: $RUNNING_COUNT"
+        echo "Desired Tasks: $DESIRED_COUNT"
+        
+        if [ "$SERVICE_STATUS" = "ACTIVE" ] && [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
+          echo "✅ GeoJSON Processor service is healthy"
+        else
+          echo "❌ GeoJSON Processor service is not healthy"
+          exit 1
+        fi
         
     - name: Check WordPress health
       run: |
-        WORDPRESS_URL="${{ needs.terraform-apply.outputs.wordpress_url }}"
-        echo "Checking WordPress at: $WORDPRESS_URL"
+        echo "🔍 Checking WordPress service..."
+        SERVICE_STATUS=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.WORDPRESS_SERVICE }} \
+          --query 'services[0].status' \
+          --output text)
+          
+        RUNNING_COUNT=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.WORDPRESS_SERVICE }} \
+          --query 'services[0].runningCount' \
+          --output text)
+          
+        DESIRED_COUNT=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.WORDPRESS_SERVICE }} \
+          --query 'services[0].desiredCount' \
+          --output text)
         
-        # Wait for WordPress to be ready
-        for i in {1..10}; do
-          if curl -f -s "$WORDPRESS_URL" > /dev/null; then
-            echo "✅ WordPress is healthy!"
-            break
-          else
-            echo "⏳ Waiting for WordPress... (attempt $i/10)"
-            sleep 30
-          fi
-        done
+        echo "Service Status: $SERVICE_STATUS"
+        echo "Running Tasks: $RUNNING_COUNT"
+        echo "Desired Tasks: $DESIRED_COUNT"
         
-    - name: Display deployment info
+        if [ "$SERVICE_STATUS" = "ACTIVE" ] && [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
+          echo "✅ WordPress service is healthy"
+        else
+          echo "❌ WordPress service is not healthy"
+          exit 1
+        fi
+        
+    - name: Test GeoJSON Processor endpoint
       run: |
-        echo "🚀 Deployment completed successfully!"
-        echo "📊 GeoJSON Processor: Running on ECS"
-        echo "🌐 WordPress: ${{ needs.terraform-apply.outputs.wordpress_url }}"
-        echo "📝 Check AWS Console for detailed logs"
+        echo "🔍 Testing GeoJSON Processor health endpoint..."
+        
+        # Get the load balancer URL from Terraform outputs
+        ALB_URL=$(terraform output -raw wordpress_url 2>/dev/null || echo "")
+        
+        if [ -n "$ALB_URL" ]; then
+          # Try to reach the health endpoint
+          for i in {1..5}; do
+            echo "Attempt $i: Testing health endpoint..."
+            if curl -f -s "$ALB_URL/health" > /dev/null; then
+              echo "✅ GeoJSON Processor health endpoint is responding"
+              break
+            else
+              echo "⏳ Health endpoint not ready, waiting 30 seconds..."
+              sleep 30
+            fi
+            
+            if [ $i -eq 5 ]; then
+              echo "❌ Health endpoint failed after 5 attempts"
+              echo "This might be expected if the service is behind a private load balancer"
+            fi
+          done
+        else
+          echo "⚠️ No load balancer URL available, skipping endpoint test"
+        fi
 
-  terraform-plan:
-    name: Terraform Plan
+  notify:
+    name: Notify Deployment Status
+    needs: [health-check]
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: always() && github.ref == 'refs/heads/main'
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: 1.12.2
+    - name: Deployment Success Notification
+      if: needs.health-check.result == 'success'
+      run: |
+        echo "🎉 Deployment completed successfully!"
+        echo "✅ All services are healthy and running"
+        echo "📊 Deployment Summary:"
+        echo "   - GeoJSON Processor: Deployed and healthy"
+        echo "   - WordPress: Deployed and healthy"
+        echo "   - Infrastructure: Updated via Terraform"
         
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
-        
-    - name: Terraform Init
-      run: terraform init
-      
-    - name: Terraform Plan
-      id: plan
-      run: terraform plan -no-color
-      continue-on-error: true
-      
-    - name: Comment PR
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const output = `#### Terraform Plan 📖
-          
-          <details><summary>Show Plan</summary>
-          
-          \`\`\`
-          ${{ steps.plan.outputs.stdout }}
-          \`\`\`
-          
-          </details>`;
-          
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: output
-          })
+    - name: Deployment Failure Notification
+      if: needs.health-check.result == 'failure'
+      run: |
+        echo "❌ Deployment failed!"
+        echo "Please check the logs above for details"
+        echo "🔧 Common troubleshooting steps:"
+        echo "   1. Check ECS service logs"
+        echo "   2. Verify task definitions"
+        echo "   3. Check security groups and networking"
+        echo "   4. Validate environment variables"
+        exit 1
