@@ -42,19 +42,32 @@ jobs:
     - name: Terraform Init
       run: terraform init
       
-    - name: Check Terraform State
+    - name: Check Remote State
       id: check-state
       run: |
-        if terraform show -json > /dev/null 2>&1; then
-          RESOURCES=$(terraform state list | wc -l)
-          echo "has_state=true" >> $GITHUB_OUTPUT
-          echo "resources_count=$RESOURCES" >> $GITHUB_OUTPUT
-          echo "📊 Found $RESOURCES resources in state"
-          terraform state list
+        echo "🔍 Checking remote state in S3..."
+        
+        # Check if state file exists in S3
+        if aws s3 ls s3://terraform-state-asterra-project/geojson-processor/terraform.tfstate > /dev/null 2>&1; then
+          echo "📁 State file found in S3"
+          
+          # Try to list resources
+          if terraform state list > /dev/null 2>&1; then
+            RESOURCES=$(terraform state list | wc -l)
+            echo "has_state=true" >> $GITHUB_OUTPUT
+            echo "resources_count=$RESOURCES" >> $GITHUB_OUTPUT
+            echo "📊 Found $RESOURCES resources in state"
+            echo "📋 Resources to be destroyed:"
+            terraform state list
+          else
+            echo "⚠️ State file exists but no resources found"
+            echo "has_state=false" >> $GITHUB_OUTPUT
+            echo "resources_count=0" >> $GITHUB_OUTPUT
+          fi
         else
+          echo "❌ No state file found in S3"
           echo "has_state=false" >> $GITHUB_OUTPUT
           echo "resources_count=0" >> $GITHUB_OUTPUT
-          echo "⚠️ No Terraform state found"
         fi
 
   destroy:
@@ -109,17 +122,11 @@ jobs:
         REMAINING=$(terraform state list | wc -l || echo "0")
         if [ "$REMAINING" -eq 0 ]; then
           echo "🎉 All resources successfully destroyed!"
+          echo "🧹 Cleaning up remote state file..."
+          aws s3 rm s3://terraform-state-asterra-project/geojson-processor/terraform.tfstate || echo "State file already removed"
         else
           echo "⚠️ $REMAINING resources still remain:"
           terraform state list || echo "Could not list remaining resources"
-        fi
-        
-    - name: Cleanup Local State (if empty)
-      run: |
-        if [ "$(terraform state list | wc -l)" -eq 0 ]; then
-          echo "🧹 Cleaning up empty state file..."
-          rm -f terraform.tfstate terraform.tfstate.backup
-          echo "State files cleaned up"
         fi
 
   manual-cleanup:
@@ -193,3 +200,41 @@ jobs:
         echo "ℹ️ No Terraform state found - nothing to destroy"
         echo "💡 If you have resources in AWS, they may have been created outside of Terraform"
         echo "💡 Check the manual-cleanup job for AWS resource cleanup"
+
+  emergency-cleanup:
+    name: Emergency AWS Cleanup (No State)
+    needs: pre-destroy-check
+    runs-on: ubuntu-latest
+    if: needs.pre-destroy-check.outputs.has_state == 'false' && github.event.inputs.confirm_destroy == 'DESTROY'
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: Emergency cleanup all resources
+      run: |
+        echo "🚨 Emergency cleanup - destroying resources without state"
+        echo "🧹 This will attempt to find and destroy known resources"
+        
+        # Cleanup ECR
+        aws ecr describe-repositories --query 'repositories[?repositoryName==`geojson-processor`].repositoryName' --output text | \
+        xargs -r -I {} aws ecr delete-repository --repository-name {} --force || echo "ECR cleanup completed"
+        
+        # Cleanup ECS
+        CLUSTER="geojson-processor-cluster"
+        for SERVICE in geojson-processor-service wordpress-service; do
+          aws ecs update-service --cluster $CLUSTER --service $SERVICE --desired-count 0 || echo "Service $SERVICE not found"
+          aws ecs delete-service --cluster $CLUSTER --service $SERVICE || echo "Service $SERVICE not found"
+        done
+        aws ecs delete-cluster --cluster $CLUSTER || echo "Cluster not found"
+        
+        # Cleanup RDS
+        for DB in my-postgres-db wordpress-db; do
+          aws rds delete-db-instance --db-instance-identifier $DB --skip-final-snapshot || echo "DB $DB not found"
+        done
+        
+        echo "🏁 Emergency cleanup completed"
