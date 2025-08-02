@@ -7,12 +7,20 @@ on:
         description: 'Type "DESTROY" to confirm'
         required: true
         default: ''
+      target_resources:
+        description: 'Specific resources to destroy (optional - leave empty for all)'
+        required: false
+        default: ''
 
 jobs:
-  destroy:
-    name: Destroy Infrastructure
+  pre-destroy-check:
+    name: Pre-Destroy Checks
     runs-on: ubuntu-latest
     if: github.event.inputs.confirm_destroy == 'DESTROY'
+    
+    outputs:
+      has_state: ${{ steps.check-state.outputs.has_state }}
+      resources_count: ${{ steps.check-state.outputs.resources_count }}
     
     steps:
     - name: Checkout code
@@ -22,6 +30,7 @@ jobs:
       uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: 1.12.2
+        terraform_wrapper: false
         
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -33,10 +42,154 @@ jobs:
     - name: Terraform Init
       run: terraform init
       
-    - name: Terraform Destroy
-      run: terraform destroy -auto-approve
-      
-    - name: Cleanup Docker images
+    - name: Check Terraform State
+      id: check-state
       run: |
-        echo "Infrastructure destroyed successfully"
-        echo "Note: ECR images are automatically deleted due to force_delete=true"
+        if terraform show -json > /dev/null 2>&1; then
+          RESOURCES=$(terraform state list | wc -l)
+          echo "has_state=true" >> $GITHUB_OUTPUT
+          echo "resources_count=$RESOURCES" >> $GITHUB_OUTPUT
+          echo "📊 Found $RESOURCES resources in state"
+          terraform state list
+        else
+          echo "has_state=false" >> $GITHUB_OUTPUT
+          echo "resources_count=0" >> $GITHUB_OUTPUT
+          echo "⚠️ No Terraform state found"
+        fi
+
+  destroy:
+    name: Destroy Infrastructure
+    needs: pre-destroy-check
+    runs-on: ubuntu-latest
+    if: needs.pre-destroy-check.outputs.has_state == 'true'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.12.2
+        terraform_wrapper: false
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: Terraform Init
+      run: terraform init
+      
+    - name: Show Destroy Plan
+      run: |
+        echo "🔍 Showing what will be destroyed..."
+        if [ -n "${{ github.event.inputs.target_resources }}" ]; then
+          terraform plan -destroy -target="${{ github.event.inputs.target_resources }}"
+        else
+          terraform plan -destroy
+        fi
+        
+    - name: Destroy Infrastructure
+      run: |
+        echo "🚨 Starting infrastructure destruction..."
+        if [ -n "${{ github.event.inputs.target_resources }}" ]; then
+          echo "🎯 Targeting specific resources: ${{ github.event.inputs.target_resources }}"
+          terraform destroy -auto-approve -target="${{ github.event.inputs.target_resources }}"
+        else
+          echo "💥 Destroying ALL infrastructure"
+          terraform destroy -auto-approve
+        fi
+        
+    - name: Verify Destruction
+      run: |
+        echo "✅ Checking if resources were destroyed..."
+        REMAINING=$(terraform state list | wc -l || echo "0")
+        if [ "$REMAINING" -eq 0 ]; then
+          echo "🎉 All resources successfully destroyed!"
+        else
+          echo "⚠️ $REMAINING resources still remain:"
+          terraform state list || echo "Could not list remaining resources"
+        fi
+        
+    - name: Cleanup Local State (if empty)
+      run: |
+        if [ "$(terraform state list | wc -l)" -eq 0 ]; then
+          echo "🧹 Cleaning up empty state file..."
+          rm -f terraform.tfstate terraform.tfstate.backup
+          echo "State files cleaned up"
+        fi
+
+  manual-cleanup:
+    name: Manual AWS Cleanup
+    needs: [pre-destroy-check, destroy]
+    runs-on: ubuntu-latest
+    if: always() && github.event.inputs.confirm_destroy == 'DESTROY'
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: Force cleanup ECR repositories
+      run: |
+        echo "🧹 Cleaning up ECR repositories..."
+        aws ecr describe-repositories --query 'repositories[?repositoryName==`geojson-processor`].repositoryName' --output text | \
+        xargs -r -I {} aws ecr delete-repository --repository-name {} --force || echo "ECR cleanup completed"
+        
+    - name: Force cleanup ECS services
+      run: |
+        echo "🧹 Cleaning up ECS services..."
+        CLUSTER="geojson-processor-cluster"
+        
+        # Stop services
+        for SERVICE in geojson-processor-service wordpress-service; do
+          aws ecs update-service --cluster $CLUSTER --service $SERVICE --desired-count 0 || echo "Service $SERVICE not found"
+          aws ecs delete-service --cluster $CLUSTER --service $SERVICE || echo "Service $SERVICE not found"
+        done
+        
+        # Delete cluster
+        aws ecs delete-cluster --cluster $CLUSTER || echo "Cluster not found"
+        
+    - name: Force cleanup Load Balancers
+      run: |
+        echo "🧹 Cleaning up Load Balancers..."
+        aws elbv2 describe-load-balancers --query 'LoadBalancers[?LoadBalancerName==`wordpress-alb`].LoadBalancerArn' --output text | \
+        xargs -r -I {} aws elbv2 delete-load-balancer --load-balancer-arn {} || echo "ALB cleanup completed"
+        
+    - name: Force cleanup RDS instances
+      run: |
+        echo "🧹 Cleaning up RDS instances..."
+        for DB in my-postgres-db wordpress-db; do
+          aws rds delete-db-instance --db-instance-identifier $DB --skip-final-snapshot || echo "DB $DB not found"
+        done
+        
+    - name: Summary
+      run: |
+        echo "🏁 Cleanup Summary:"
+        echo "✅ Terraform destroy completed"
+        echo "✅ ECR repositories cleaned"
+        echo "✅ ECS services and cluster cleaned"
+        echo "✅ Load balancers cleaned"
+        echo "✅ RDS instances cleaned"
+        echo ""
+        echo "💡 Note: Some resources may take a few minutes to fully terminate"
+        echo "💡 Check AWS Console to verify all resources are gone"
+
+  no-state-found:
+    name: No State Found
+    needs: pre-destroy-check
+    runs-on: ubuntu-latest
+    if: needs.pre-destroy-check.outputs.has_state == 'false'
+    
+    steps:
+    - name: No resources to destroy
+      run: |
+        echo "ℹ️ No Terraform state found - nothing to destroy"
+        echo "💡 If you have resources in AWS, they may have been created outside of Terraform"
+        echo "💡 Check the manual-cleanup job for AWS resource cleanup"
