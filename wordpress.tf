@@ -1,3 +1,4 @@
+
 # Application Load Balancer for WordPress
 resource "aws_lb" "wordpress" {
   name               = "wordpress-alb"
@@ -45,10 +46,10 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# Security Group for WordPress ECS Tasks
-resource "aws_security_group" "wordpress_tasks" {
-  name        = "wordpress-tasks-sg"
-  description = "Security group for WordPress ECS tasks"
+# Security Group for WordPress EC2 Instance
+resource "aws_security_group" "wordpress_instance" {
+  name        = "wordpress-instance-sg"
+  description = "Security group for WordPress EC2 instance"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
@@ -66,7 +67,7 @@ resource "aws_security_group" "wordpress_tasks" {
   }
 
   tags = {
-    Name = "WordPress Tasks Security Group"
+    Name = "WordPress Instance Security Group"
   }
 }
 
@@ -76,7 +77,7 @@ resource "aws_lb_target_group" "wordpress" {
   port        = 80
   protocol    = "HTTP"
   vpc_id      = module.vpc.vpc_id
-  target_type = "ip"
+  target_type = "instance"
 
   health_check {
     enabled             = true
@@ -107,99 +108,37 @@ resource "aws_lb_listener" "wordpress" {
   }
 }
 
-# WordPress ECS Task Definition
-resource "aws_ecs_task_definition" "wordpress" {
-  family                   = "wordpress"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "512"
-  memory                   = "1024"
-  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
-  task_role_arn           = aws_iam_role.ecs_task_role.arn
-
-  container_definitions = jsonencode([
-    {
-      name  = "wordpress"
-      image = "wordpress:latest"
-      
-      essential = true
-      
-      portMappings = [
-        {
-          containerPort = 80
-          protocol      = "tcp"
-        }
-      ]
-
-      environment = [
-        {
-          name  = "WORDPRESS_DB_HOST"
-          value = split(":", aws_db_instance.wordpress.endpoint)[0]
-        },
-        {
-          name  = "WORDPRESS_DB_USER"
-          value = var.db_username
-        },
-        {
-          name  = "WORDPRESS_DB_PASSWORD"
-          value = var.db_password
-        },
-        {
-          name  = "WORDPRESS_DB_NAME"
-          value = "wordpress"
-        }
-      ]
-
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.wordpress_logs.name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
-    }
-  ])
-
-  depends_on = [
-    aws_cloudwatch_log_group.wordpress_logs
-  ]
-}
-
-# CloudWatch Log Group for WordPress
-resource "aws_cloudwatch_log_group" "wordpress_logs" {
-  name              = "/ecs/wordpress"
-  retention_in_days = 7
-  skip_destroy      = false
-}
-
-# WordPress ECS Service
-resource "aws_ecs_service" "wordpress" {
-  name            = "wordpress-service"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.wordpress.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
-
-  network_configuration {
-    subnets          = module.vpc.private_subnets
-    security_groups  = [aws_security_group.wordpress_tasks.id]
-    assign_public_ip = false
-  }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.wordpress.arn
-    container_name   = "wordpress"
-    container_port   = 80
-  }
-
-  depends_on = [
-    aws_lb_listener.wordpress
-  ]
+# WordPress EC2 Instance
+resource "aws_instance" "wordpress" {
+  ami           = "ami-0c55b159cbfafe1f0" # Example AMI, replace with a suitable WordPress AMI
+  instance_type = "t2.micro"
+  subnet_id     = module.vpc.private_subnets[0]
+  security_groups = [aws_security_group.wordpress_instance.name]
 
   tags = {
-    Name = "WordPress Service"
+    Name = "WordPress Instance"
   }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              sudo apt update -y
+              sudo apt install -y httpd php php-mysql
+              cd /var/www/html
+              wget https://wordpress.org/latest.tar.gz
+              tar -xzf latest.tar.gz
+              mv wordpress/* .
+              rm -rf wordpress latest.tar.gz
+              chown -R apache:apache /var/www/html
+              systemctl enable httpd
+              systemctl start httpd
+              EOF
+}
+
+# Attach EC2 Instance to Target Group
+resource "aws_lb_target_group_attachment" "wordpress" {
+  target_group_arn = aws_lb_target_group.wordpress.arn
+  target_id        = aws_instance.wordpress.id
+  port             = 80
 }
 
 # Create WordPress database
