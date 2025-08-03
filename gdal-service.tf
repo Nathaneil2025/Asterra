@@ -26,8 +26,8 @@ resource "aws_security_group" "gdal_service" {
 
 # GDAL EC2 Instance
 resource "aws_instance" "gdal_service" {
-  ami           = "ami-0c55b159cbfafe1f0" # Replace with a suitable AMI
-  instance_type = "t2.micro"
+  ami           = "ami-01c79f8fca6bc28c3" # Replace with a suitable AMI
+  instance_type = "t3.micro"
   subnet_id     = module.vpc.private_subnets[0] # Deploy in a private subnet
   security_groups = [aws_security_group.gdal_service.name]
 
