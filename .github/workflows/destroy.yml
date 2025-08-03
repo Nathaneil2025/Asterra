@@ -388,4 +388,187 @@ jobs:
             done
             
             # Detach all managed policies from the group
-            aws iam list-attached-group-policies --group-name "$GROUP_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read
+                        aws iam list-attached-group-policies --group-name "$GROUP_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read POLICY_ARN; do
+              if [ ! -z "$POLICY_ARN" ]; then
+                echo "  Detaching managed policy $POLICY_ARN from group $GROUP_NAME"
+                aws iam detach-group-policy --group-name "$GROUP_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach policy $POLICY_ARN"
+              fi
+            done
+            
+            # Delete all inline policies from the group
+            aws iam list-group-policies --group-name "$GROUP_NAME" --query 'PolicyNames' --output text | tr '\t' '\n' | while read POLICY_NAME; do
+              if [ ! -z "$POLICY_NAME" ]; then
+                echo "  Deleting inline policy $POLICY_NAME from group $GROUP_NAME"
+                aws iam delete-group-policy --group-name "$GROUP_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete inline policy $POLICY_NAME"
+              fi
+            done
+            
+            # Delete the group
+            echo "  Deleting IAM group: $GROUP_NAME"
+            aws iam delete-group --group-name "$GROUP_NAME" || echo "  Failed to delete group $GROUP_NAME"
+          fi
+        done
+
+    - name: 18. Cleanup IAM Roles
+      run: |
+        echo "🧹 STEP 18: DESTROYING ALL CUSTOM IAM ROLES..."
+        
+        # Get all IAM roles (excluding AWS service roles)
+        aws iam list-roles --query 'Roles[?!starts_with(RoleName, `AWS`) && !starts_with(RoleName, `aws-`) && !starts_with(RoleName, `service-role`)].RoleName' --output text | tr '\t' '\n' | while read ROLE_NAME; do
+          if [ ! -z "$ROLE_NAME" ]; then
+            echo "Processing IAM role: $ROLE_NAME"
+            
+            # Detach all managed policies from the role
+            aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read POLICY_ARN; do
+              if [ ! -z "$POLICY_ARN" ]; then
+                echo "  Detaching managed policy $POLICY_ARN from role $ROLE_NAME"
+                aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach policy $POLICY_ARN"
+              fi
+            done
+            
+            # Delete all inline policies from the role
+            aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text | tr '\t' '\n' | while read POLICY_NAME; do
+              if [ ! -z "$POLICY_NAME" ]; then
+                echo "  Deleting inline policy $POLICY_NAME from role $ROLE_NAME"
+                aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete inline policy $POLICY_NAME"
+              fi
+            done
+            
+            # Remove role from instance profiles
+            aws iam list-instance-profiles-for-role --role-name "$ROLE_NAME" --query 'InstanceProfiles[*].InstanceProfileName' --output text | tr '\t' '\n' | while read PROFILE_NAME; do
+              if [ ! -z "$PROFILE_NAME" ]; then
+                echo "  Removing role $ROLE_NAME from instance profile $PROFILE_NAME"
+                aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME" || echo "  Failed to remove role from profile"
+              fi
+            done
+            
+            # Delete the role
+            echo "  Deleting IAM role: $ROLE_NAME"
+            aws iam delete-role --role-name "$ROLE_NAME" || echo "  Failed to delete role $ROLE_NAME"
+          fi
+        done
+
+    - name: 19. Cleanup IAM Policies
+      run: |
+        echo "🧹 STEP 19: DESTROYING ALL CUSTOM IAM POLICIES..."
+        
+        # Get all customer managed policies (not AWS managed)
+        aws iam list-policies --scope Local --query 'Policies[*].[PolicyName,Arn]' --output text | while read POLICY_NAME POLICY_ARN; do
+          if [ ! -z "$POLICY_ARN" ]; then
+            echo "Processing custom IAM policy: $POLICY_NAME ($POLICY_ARN)"
+            
+            # Get all policy versions
+            aws iam list-policy-versions --policy-arn "$POLICY_ARN" --query 'Versions[?!IsDefaultVersion].VersionId' --output text | tr '\t' '\n' | while read VERSION_ID; do
+              if [ ! -z "$VERSION_ID" ]; then
+                echo "  Deleting policy version: $VERSION_ID"
+                aws iam delete-policy-version --policy-arn "$POLICY_ARN" --version-id "$VERSION_ID" || echo "  Failed to delete version $VERSION_ID"
+              fi
+            done
+            
+            # Delete the policy
+            echo "  Deleting IAM policy: $POLICY_NAME"
+            aws iam delete-policy --policy-arn "$POLICY_ARN" || echo "  Failed to delete policy $POLICY_NAME"
+          fi
+        done
+
+    - name: 20. Cleanup IAM Instance Profiles
+      run: |
+        echo "🧹 STEP 20: DESTROYING ALL IAM INSTANCE PROFILES..."
+        
+        aws iam list-instance-profiles --query 'InstanceProfiles[*].InstanceProfileName' --output text | tr '\t' '\n' | while read PROFILE_NAME; do
+          if [ ! -z "$PROFILE_NAME" ]; then
+            echo "Deleting instance profile: $PROFILE_NAME"
+            aws iam delete-instance-profile --instance-profile-name "$PROFILE_NAME" || echo "Failed to delete instance profile $PROFILE_NAME"
+          fi
+        done
+
+    - name: 21. Cleanup DynamoDB Tables
+      run: |
+        echo "🧹 STEP 21: DESTROYING ALL DYNAMODB TABLES..."
+        
+        aws dynamodb list-tables --query 'TableNames' --output text | tr '\t' '\n' | while read TABLE_NAME; do
+          if [ ! -z "$TABLE_NAME" ]; then
+            echo "Deleting DynamoDB table: $TABLE_NAME"
+            aws dynamodb delete-table --table-name "$TABLE_NAME" || echo "Failed to delete table $TABLE_NAME"
+          fi
+        done
+
+    - name: 22. Cleanup API Gateway APIs
+      run: |
+        echo "🧹 STEP 22: DESTROYING ALL API GATEWAY APIs..."
+        
+        # REST APIs
+        aws apigateway get-rest-apis --query 'items[*].[id,name]' --output text | while read API_ID API_NAME; do
+          if [ ! -z "$API_ID" ]; then
+            echo "Deleting REST API: $API_NAME ($API_ID)"
+            aws apigateway delete-rest-api --rest-api-id "$API_ID" || echo "Failed to delete REST API $API_ID"
+          fi
+        done
+        
+        # HTTP APIs (API Gateway v2)
+        aws apigatewayv2 get-apis --query 'Items[*].[ApiId,Name]' --output text | while read API_ID API_NAME; do
+          if [ ! -z "$API_ID" ]; then
+            echo "Deleting HTTP API: $API_NAME ($API_ID)"
+            aws apigatewayv2 delete-api --api-id "$API_ID" || echo "Failed to delete HTTP API $API_ID"
+          fi
+        done
+
+    - name: 23. Final Verification
+      run: |
+        echo "🔍 FINAL VERIFICATION - SCANNING FOR REMAINING RESOURCES..."
+        echo "============================================================"
+        
+        echo "=== REMAINING EC2 INSTANCES ==="
+        INSTANCES=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text)
+        if [ -z "$INSTANCES" ]; then
+          echo "✅ No EC2 instances remaining"
+        else
+          echo "⚠️ Remaining instances: $INSTANCES"
+        fi
+        
+        echo "=== REMAINING RDS INSTANCES ==="
+        RDS_INSTANCES=$(aws rds describe-db-instances --query 'DBInstances[*].DBInstanceIdentifier' --output text)
+        if [ -z "$RDS_INSTANCES" ]; then
+          echo "✅ No RDS instances remaining"
+        else
+          echo "⚠️ Remaining RDS instances: $RDS_INSTANCES"
+        fi
+        
+        echo "=== REMAINING S3 BUCKETS ==="
+        BUCKETS=$(aws s3 ls | awk '{print $3}' | tr '\n' ' ')
+        if [ -z "$BUCKETS" ]; then
+          echo "✅ No S3 buckets remaining"
+        else
+          echo "⚠️ Remaining buckets: $BUCKETS"
+        fi
+        
+        echo "=== REMAINING ECR REPOSITORIES ==="
+        ECR_REPOS=$(aws ecr describe-repositories --query 'repositories[*].repositoryName' --output text)
+        if [ -z "$ECR_REPOS" ]; then
+          echo "✅ No ECR repositories remaining"
+        else
+          echo "⚠️ Remaining ECR repos: $ECR_REPOS"
+        fi
+        
+        echo "=== REMAINING ECS CLUSTERS ==="
+        ECS_CLUSTERS=$(aws ecs list-clusters --query 'clusterArns' --output text)
+        if [ -z "$ECS_CLUSTERS" ]; then
+          echo "✅ No ECS clusters remaining"
+        else
+          echo "⚠️ Remaining ECS clusters: $ECS_CLUSTERS"
+        fi
+        
+        echo "=== REMAINING LAMBDA FUNCTIONS ==="
+        LAMBDA_FUNCS=$(aws lambda list-functions --query 'Functions[*].FunctionName' --output text)
+        if [ -z "$LAMBDA_FUNCS" ]; then
+          echo "✅ No Lambda functions remaining"
+        else
+          echo "⚠️ Remaining Lambda functions: $LAMBDA_FUNCS"
+        fi
+        
+        echo ""
+        echo "🎯 NUCLEAR CLEANUP COMPLETED!"
+        echo "============================================"
+        echo "All AWS resources have been processed for deletion."
+        echo "Some resources may take additional time to fully terminate."
+        echo "Please check the AWS Console to verify complete cleanup."
