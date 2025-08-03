@@ -5,9 +5,7 @@ terraform {
   # No backend configuration - uses local state for bootstrapping
 }
 
-provider "aws" {
-  region = "eu-central-1"
-}
+
 
 # S3 bucket for storing Terraform state
 resource "aws_s3_bucket" "terraform_state" {
