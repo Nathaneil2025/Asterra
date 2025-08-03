@@ -223,31 +223,44 @@ jobs:
         if aws s3 ls s3://terraform-state-asterra-project/ > /dev/null 2>&1 && \
            aws dynamodb describe-table --table-name terraform-state-lock --region eu-central-1 > /dev/null 2>&1; then
           echo "✅ State infrastructure exists - skipping creation"
+          
+          # Ensure state-setup.tf is disabled
+          if [ -f "state-setup.tf" ]; then
+            mv state-setup.tf state-setup.tf.disabled
+            echo "✅ Disabled state-setup.tf to prevent conflicts"
+          fi
         else
           echo "🏗️ Creating state infrastructure..."
           
-          # Temporarily uncomment the state resources in backend.tf
-          sed -i 's/^# resource "aws_s3_bucket" "terraform_state"/resource "aws_s3_bucket" "terraform_state"/' backend.tf
-          sed -i 's/^# resource "aws_s3_bucket_versioning"/resource "aws_s3_bucket_versioning"/' backend.tf
-          sed -i 's/^# resource "aws_s3_bucket_server_side_encryption_configuration"/resource "aws_s3_bucket_server_side_encryption_configuration"/' backend.tf
-          sed -i 's/^# resource "aws_s3_bucket_public_access_block"/resource "aws_s3_bucket_public_access_block"/' backend.tf
-          sed -i 's/^# resource "aws_dynamodb_table"/resource "aws_dynamodb_table"/' backend.tf
-          sed -i 's/^#   /  /g' backend.tf
-          sed -i 's/^# }/}/g' backend.tf
+          # Ensure state-setup.tf is enabled
+          if [ -f "state-setup.tf.disabled" ]; then
+            mv state-setup.tf.disabled state-setup.tf
+            echo "✅ Enabled state-setup.tf for bootstrapping"
+          fi
           
-          # Comment out the backend configuration temporarily
-          sed -i 's/^terraform {/# terraform {/' backend.tf
-          sed -i 's/^  backend "s3"/# backend "s3"/' backend.tf
-          sed -i '/^  backend "s3"/,/^  }/s/^/# /' backend.tf
+          # Temporarily rename backend.tf to avoid conflicts
+          if [ -f "backend.tf" ]; then
+            mv backend.tf backend.tf.temp
+            echo "✅ Temporarily disabled backend configuration"
+          fi
           
-          # Create state infrastructure with local state
+          # Initialize and create state infrastructure with local state
           terraform init
-          terraform apply -auto-approve -target=aws_s3_bucket.terraform_state -target=aws_dynamodb_table.terraform_state_lock
+          terraform plan -out=state-plan
+          terraform apply state-plan
           
-          # Restore backend configuration and comment out state resources
-          git checkout backend.tf
+          # Restore backend.tf and disable state-setup.tf
+          if [ -f "backend.tf.temp" ]; then
+            mv backend.tf.temp backend.tf
+            echo "✅ Restored backend configuration"
+          fi
           
-          echo "✅ State infrastructure created"
+          if [ -f "state-setup.tf" ]; then
+            mv state-setup.tf state-setup.tf.disabled
+            echo "✅ Disabled state-setup.tf after creation"
+          fi
+          
+          echo "✅ State infrastructure created successfully"
         fi
 
     - name: Deploy Application Infrastructure
