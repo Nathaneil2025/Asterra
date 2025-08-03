@@ -9,7 +9,7 @@ resource "aws_security_group" "gdal_service" {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # Allow SSH access, restrict in production
+    cidr_blocks = ["192.168.0.0/16"] # Allow SSH access from 192.168.0.0/16
   }
 
   egress {
@@ -23,8 +23,6 @@ resource "aws_security_group" "gdal_service" {
     Name = "GDAL Service Security Group"
   }
 }
-
-# GDAL EC2 Instance
 
 # GDAL EC2 Instance
 resource "aws_instance" "gdal_service" {
