@@ -1,0 +1,48 @@
+cleanup-verification:
+    name: Final Cleanup Verification
+    needs: [destroy-application, destroy-state-infrastructure]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    # ... rest of the steps ...
+    
+    - name: Post-Destruction Notice
+      run: |
+        echo "📢 POST-DESTRUCTION NOTICE"
+        echo "========================="
+        echo ""
+        echo "✅ Infrastructure destruction completed successfully!"
+        echo ""
+        echo "📋 What was destroyed:"
+        echo "  • All application infrastructure (ECS, RDS, VPC, etc.)"
+        echo "  • All Docker images in ECR"
+        echo "  • All application data"
+        if [ "${{ github.event.inputs.destroy_state_infrastructure }}" = "true" ]; then
+          echo "  • Terraform state infrastructure"
+          echo "  • All Terraform state history"
+          echo ""
+          echo "⚠️  IMPORTANT: State infrastructure was destroyed!"
+          echo "   To deploy again, you'll need to:"
+          echo "   1. Remove or rename backend.tf"
+          echo "   2. Run terraform init with local state"
+          echo "   3. Recreate state infrastructure first"
+        else
+          echo ""
+          echo "ℹ️  State infrastructure was preserved"
+          echo "   You can redeploy by running the CI/CD pipeline again"
+        fi
+        echo ""
+        echo "🔍 If you see any remaining resources above, you may need to:"
+        echo "  • Delete them manually in the AWS console"
+        echo "  • Check for resources in other regions"
+        echo "  • Verify IAM permissions for cleanup"
+        echo ""
+        echo "💰 Remember to check your AWS billing to ensure no unexpected charges"
