@@ -1,496 +1,191 @@
-name: CI/CD Pipeline
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-env:
-  AWS_REGION: eu-central-1
-  ECR_REPOSITORY: geojson-processor
-  ECS_CLUSTER: geojson-processor-cluster
-  ECS_SERVICE: geojson-processor-service
-  WORDPRESS_SERVICE: wordpress-service
-
-jobs:
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-        
-    - name: Install dependencies
-      run: |
-        cd geojson-processor
-        pip install -r requirements.txt
-        pip install pytest pytest-cov
-        
-    - name: Run tests
-      run: |
-        cd geojson-processor
-        pytest tests/ --cov=. --cov-report=xml || echo "Tests completed"
-
-  security-scan:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
-      with:
-        scan-type: 'fs'
-        scan-ref: './geojson-processor'
-        format: 'table'
-
-  terraform-plan:
-    name: Terraform Plan
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: 1.12.2
-        terraform_wrapper: false
-        
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-        
-    - name: Check Remote State Setup
-      run: |
-        echo "🔍 Checking remote state setup for PR..."
-        
-        # Check if S3 bucket exists
-        if aws s3 ls s3://terraform-state-asterra-project/ > /dev/null 2>&1; then
-          echo "✅ S3 bucket exists"
-          S3_EXISTS=true
-        else
-          echo "⚠️ S3 bucket not found - this is expected for first-time setup"
-          S3_EXISTS=false
-        fi
-        
-        # Check if DynamoDB table exists
-        if aws dynamodb describe-table --table-name terraform-state-lock --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
-          echo "✅ DynamoDB lock table exists"
-          DYNAMO_EXISTS=true
-        else
-          echo "⚠️ DynamoDB lock table not found - this is expected for first-time setup"
-          DYNAMO_EXISTS=false
-        fi
-        
-        # If remote state doesn't exist, we'll use local state for planning
-        if [ "$S3_EXISTS" = false ] || [ "$DYNAMO_EXISTS" = false ]; then
-          echo "📝 Remote state not available - will use local state for planning"
-          echo "   (Remote state will be automatically created when merging to main)"
-          
-          # Temporarily rename backend.tf to disable remote state for planning
-          if [ -f "backend.tf" ]; then
-            mv backend.tf backend.tf.disabled
-            echo "   Temporarily disabled remote backend for PR planning"
+        aws rds describe-db-parameter-groups --query 'DBParameterGroups[?!starts_with(DBParameterGroupName, `default.`)].DBParameterGroupName' --output text | tr '\t' '\n' | while read PG; do
+          if [ ! -z "$PG" ]; then
+            echo "Deleting parameter group: $PG"
+            aws rds delete-db-parameter-group --db-parameter-group-name "$PG" || echo "Failed to delete $PG"
           fi
-        fi
+        done
         
-    - name: Terraform Init
-      run: terraform init
-      
-    - name: Terraform Validate
-      run: terraform validate
-      
-    - name: Terraform Plan
-      id: plan
-      run: terraform plan -no-color
-      continue-on-error: true
-      
-    - name: Restore Backend Configuration
-      if: always()
-      run: |
-        # Restore backend.tf if it was disabled
-        if [ -f "backend.tf.disabled" ]; then
-          mv backend.tf.disabled backend.tf
-          echo "✅ Restored backend configuration"
-        fi
-      
-    - name: Comment PR
-      uses: actions/github-script@v7
-      if: github.event_name == 'pull_request'
-      with:
-        script: |
-          const output = `#### Terraform Plan 📖
-          
-          <details><summary>Show Plan</summary>
-          
-          \`\`\`terraform
-          ${{ steps.plan.outputs.stdout }}
-          \`\`\`
-          
-          </details>
-          
-          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*
-          
-          > **Note**: If this is the first deployment, remote state infrastructure will be automatically created when this PR is merged to main.`;
-          
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: output
-          })
+        # Delete subnet groups
+        aws rds describe-db-subnet-groups --query 'DBSubnetGroups[?!starts_with(DBSubnetGroupName, `default`)].DBSubnetGroupName' --output text | tr '\t' '\n' | while read SG; do
+          if [ ! -z "$SG" ]; then
+            echo "Deleting subnet group: $SG"
+            aws rds delete-db-subnet-group --db-subnet-group-name "$SG" || echo "Failed to delete $SG"
+          fi
+        done
 
-  terraform-apply:
-    name: Terraform Apply
-    needs: [test, security-scan]
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
-    outputs:
-      wordpress_url: ${{ steps.terraform-output.outputs.wordpress_url }}
-      ecr_repository_url: ${{ steps.terraform-output.outputs.ecr_repository_url }}
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: 1.12.2
-        terraform_wrapper: false
-        
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-        
-    - name: Auto-Setup Remote State Infrastructure
+    - name: 9. Cleanup Load Balancers and Target Groups
       run: |
-        echo "🔍 Checking remote state infrastructure..."
+        echo "🧹 STEP 9: DESTROYING ALL LOAD BALANCERS AND TARGET GROUPS..."
         
-        # Check if S3 bucket exists
-        if aws s3 ls s3://terraform-state-asterra-project/ > /dev/null 2>&1; then
-          echo "✅ S3 bucket exists"
-          S3_EXISTS=true
-        else
-          echo "❌ S3 bucket not found - will create"
-          S3_EXISTS=false
-        fi
-        
-        # Check if DynamoDB table exists
-        if aws dynamodb describe-table --table-name terraform-state-lock --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
-          echo "✅ DynamoDB lock table exists"
-          DYNAMO_EXISTS=true
-        else
-          echo "❌ DynamoDB lock table not found - will create"
-          DYNAMO_EXISTS=false
-        fi
-        
-        # If either doesn't exist, run the setup
-        if [ "$S3_EXISTS" = false ] || [ "$DYNAMO_EXISTS" = false ]; then
-          echo "🚀 Setting up remote state infrastructure automatically..."
-          
-          # Make script executable
-          chmod +x quick-remote-state-setup.sh
-          
-          # Run the setup script non-interactively
-          echo "yes" | ./quick-remote-state-setup.sh
-          
-          echo "✅ Remote state infrastructure setup completed"
-          
-          # Wait a moment for AWS resources to be fully available
-          echo "⏳ Waiting for resources to be fully available..."
-          sleep 10
-        else
-          echo "✅ Remote state infrastructure already exists"
-        fi
-        
-    - name: Terraform Init
-      run: terraform init
-      
-    - name: Terraform Validate
-      run: terraform validate
-      
-    - name: Terraform Plan
-      run: terraform plan -out=tfplan
-      
-    - name: Terraform Apply
-      run: terraform apply tfplan
-      
-    - name: Get Terraform Outputs
-      id: terraform-output
-      run: |
-        echo "wordpress_url=$(terraform output -raw wordpress_url 2>/dev/null || echo 'not-available')" >> $GITHUB_OUTPUT
-        echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
-
-  build-and-deploy:
-    name: Build and Deploy GeoJSON Processor
-    needs: [terraform-apply]
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-        
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
-      
-    - name: Get version
-      id: version
-      run: |
-        VERSION=$(git rev-parse --short HEAD)
-        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-        echo "IMAGE_TAG=${{ needs.terraform-apply.outputs.ecr_repository_url }}:$VERSION" >> $GITHUB_OUTPUT
-        
-    - name: Build Docker image
-      run: |
-        cd geojson-processor
-        docker build -t ${{ steps.version.outputs.IMAGE_TAG }} .
-        docker tag ${{ steps.version.outputs.IMAGE_TAG }} ${{ needs.terraform-apply.outputs.ecr_repository_url }}:latest
-        
-    - name: Push image to ECR
-      run: |
-        docker push ${{ steps.version.outputs.IMAGE_TAG }}
-        docker push ${{ needs.terraform-apply.outputs.ecr_repository_url }}:latest
-        
-    - name: Get current task definition
-      id: current-task-def
-      run: |
-        # Get the current task definition
-        TASK_DEF_ARN=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.ECS_SERVICE }} \
-          --query 'services[0].taskDefinition' \
-          --output text)
-          
-        aws ecs describe-task-definition \
-          --task-definition $TASK_DEF_ARN \
-          --query 'taskDefinition' \
-          --output json > current-task-def.json
-        
-    - name: Update task definition with new image
-      run: |
-        # Update the image in the task definition
-        jq --arg IMAGE "${{ steps.version.outputs.IMAGE_TAG }}" \
-           '.containerDefinitions[0].image = $IMAGE' \
-           current-task-def.json > updated-task-def.json
-           
-        # Remove fields that shouldn't be in registration
-        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' \
-           updated-task-def.json > final-task-def.json
-        
-    - name: Register new task definition
-      id: register-task-def
-      run: |
-        NEW_TASK_DEF=$(aws ecs register-task-definition \
-          --cli-input-json file://final-task-def.json \
-          --query 'taskDefinition.taskDefinitionArn' \
-          --output text)
-        echo "NEW_TASK_DEF_ARN=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
-        
-    - name: Deploy to ECS
-      run: |
-        aws ecs update-service \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --service ${{ env.ECS_SERVICE }} \
-          --task-definition ${{ steps.register-task-def.outputs.NEW_TASK_DEF_ARN }}
-          
-        echo "⏳ Waiting for service to stabilize..."
-        aws ecs wait services-stable \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.ECS_SERVICE }}
-        echo "✅ Service deployment completed"
-
-  deploy-wordpress:
-    name: Deploy WordPress
-    needs: [terraform-apply]
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-        
-    - name: Force WordPress service update
-      run: |
-        aws ecs update-service \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --service ${{ env.WORDPRESS_SERVICE }} \
-          --force-new-deployment
-          
-    - name: Wait for WordPress deployment
-      run: |
-        echo "⏳ Waiting for WordPress service to stabilize..."
-        aws ecs wait services-stable \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.WORDPRESS_SERVICE }}
-        echo "✅ WordPress deployment completed"
-
-  health-check:
-    name: Health Check
-    needs: [deploy-wordpress, build-and-deploy]
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
-    steps:
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-        
-    - name: Check GeoJSON Processor health
-      run: |
-        echo "🔍 Checking GeoJSON Processor service..."
-                SERVICE_STATUS=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.ECS_SERVICE }} \
-          --query 'services[0].status' \
-          --output text)
-          
-        RUNNING_COUNT=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.ECS_SERVICE }} \
-          --query 'services[0].runningCount' \
-          --output text)
-          
-        DESIRED_COUNT=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.ECS_SERVICE }} \
-          --query 'services[0].desiredCount' \
-          --output text)
-        
-        echo "Service Status: $SERVICE_STATUS"
-        echo "Running Tasks: $RUNNING_COUNT"
-        echo "Desired Tasks: $DESIRED_COUNT"
-        
-        if [ "$SERVICE_STATUS" = "ACTIVE" ] && [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
-          echo "✅ GeoJSON Processor service is healthy"
-        else
-          echo "❌ GeoJSON Processor service is not healthy"
-          exit 1
-        fi
-        
-    - name: Check WordPress health
-      run: |
-        echo "🔍 Checking WordPress service..."
-        SERVICE_STATUS=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.WORDPRESS_SERVICE }} \
-          --query 'services[0].status' \
-          --output text)
-          
-        RUNNING_COUNT=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.WORDPRESS_SERVICE }} \
-          --query 'services[0].runningCount' \
-          --output text)
-          
-        DESIRED_COUNT=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.WORDPRESS_SERVICE }} \
-          --query 'services[0].desiredCount' \
-          --output text)
-        
-        echo "Service Status: $SERVICE_STATUS"
-        echo "Running Tasks: $RUNNING_COUNT"
-        echo "Desired Tasks: $DESIRED_COUNT"
-        
-        if [ "$SERVICE_STATUS" = "ACTIVE" ] && [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
-          echo "✅ WordPress service is healthy"
-        else
-          echo "❌ WordPress service is not healthy"
-          exit 1
-        fi
-        
-    - name: Test GeoJSON Processor endpoint
-      run: |
-        echo "🔍 Testing GeoJSON Processor health endpoint..."
-        
-        # Get the load balancer URL from Terraform outputs
-        ALB_URL=$(terraform output -raw wordpress_url 2>/dev/null || echo "")
-        
-        if [ -n "$ALB_URL" ]; then
-          # Try to reach the health endpoint
-          for i in {1..5}; do
-            echo "Attempt $i: Testing health endpoint..."
-            if curl -f -s "$ALB_URL/health" > /dev/null; then
-              echo "✅ GeoJSON Processor health endpoint is responding"
-              break
-            else
-              echo "⏳ Health endpoint not ready, waiting 30 seconds..."
-              sleep 30
-            fi
+        # Delete Application Load Balancers (ALBs) and Network Load Balancers (NLBs)
+        echo "--- Deleting Application/Network Load Balancers ---"
+        aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerArn,LoadBalancerName,Type]' --output text | while read ALB_ARN ALB_NAME ALB_TYPE; do
+          if [ ! -z "$ALB_ARN" ]; then
+            echo "Deleting $ALB_TYPE Load Balancer: $ALB_NAME ($ALB_ARN)"
             
-            if [ $i -eq 5 ]; then
-              echo "❌ Health endpoint failed after 5 attempts"
-              echo "This might be expected if the service is behind a private load balancer"
-            fi
-          done
-        else
-          echo "⚠️ No load balancer URL available, skipping endpoint test"
-        fi
-
-  notify:
-    name: Notify Deployment Status
-    needs: [health-check]
-    runs-on: ubuntu-latest
-    if: always() && github.ref == 'refs/heads/main'
-    
-    steps:
-    - name: Deployment Success Notification
-      if: needs.health-check.result == 'success'
-      run: |
-        echo "🎉 Deployment completed successfully!"
-        echo "✅ All services are healthy and running"
-        echo "📊 Deployment Summary:"
-        echo "   - GeoJSON Processor: Deployed and healthy"
-        echo "   - WordPress: Deployed and healthy"
-        echo "   - Infrastructure: Updated via Terraform"
+            # First, delete all listeners
+            aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query 'Listeners[*].ListenerArn' --output text | tr '\t' '\n' | while read LISTENER_ARN; do
+              if [ ! -z "$LISTENER_ARN" ]; then
+                echo "  Deleting listener: $LISTENER_ARN"
+                aws elbv2 delete-listener --listener-arn "$LISTENER_ARN" || echo "  Failed to delete listener"
+              fi
+            done
+            
+            # Delete the load balancer
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" || echo "Failed to delete ALB: $ALB_NAME"
+            sleep 5
+          fi
+        done
         
-    - name: Deployment Failure Notification
-      if: needs.health-check.result == 'failure'
+        # Delete Classic Load Balancers (ELBs)
+        echo "--- Deleting Classic Load Balancers ---"
+        aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text | tr '\t' '\n' | while read ELB_NAME; do
+          if [ ! -z "$ELB_NAME" ]; then
+            echo "Deleting Classic ELB: $ELB_NAME"
+            aws elb delete-load-balancer --load-balancer-name "$ELB_NAME" || echo "Failed to delete ELB: $ELB_NAME"
+            sleep 5
+          fi
+        done
+        
+        # Wait for load balancers to be deleted before proceeding with target groups
+        echo "--- Waiting for load balancers to be deleted ---"
+        sleep 30
+        
+        # Delete Target Groups (after load balancers are deleted)
+        echo "--- Deleting Target Groups ---"
+        aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupArn,TargetGroupName]' --output text | while read TG_ARN TG_NAME; do
+          if [ ! -z "$TG_ARN" ]; then
+            echo "Deleting Target Group: $TG_NAME ($TG_ARN)"
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN" || echo "Failed to delete Target Group: $TG_NAME"
+            sleep 2
+          fi
+        done
+
+    - name: 10. Cleanup S3 Buckets
       run: |
-        echo "❌ Deployment failed!"
-        echo "Please check the logs above for details"
-        echo "🔧 Common troubleshooting steps:"
-        echo "   1. Check ECS service logs"
-        echo "   2. Verify task definitions"
-        echo "   3. Check security groups and networking"
-        echo "   4. Validate environment variables"
-        exit 1
+        echo "🧹 STEP 10: DESTROYING ALL S3 BUCKETS..."
+        
+        aws s3 ls | awk '{print $3}' | while read BUCKET; do
+          if [ ! -z "$BUCKET" ]; then
+            echo "Emptying and deleting bucket: $BUCKET"
+            
+            # Remove all versions and delete markers
+            aws s3api list-object-versions --bucket "$BUCKET" --query 'Versions[].{Key:Key,VersionId:VersionId}' --output text | while read KEY VERSION; do
+              if [ ! -z "$KEY" ] && [ ! -z "$VERSION" ]; then
+                aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION" || echo "Failed to delete version"
+              fi
+            done
+            
+            aws s3api list-object-versions --bucket "$BUCKET" --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' --output text | while read KEY VERSION; do
+              if [ ! -z "$KEY" ] && [ ! -z "$VERSION" ]; then
+                aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION" || echo "Failed to delete marker"
+              fi
+            done
+            
+            # Empty bucket and delete
+            aws s3 rm "s3://$BUCKET" --recursive || echo "Failed to empty $BUCKET"
+            aws s3 rb "s3://$BUCKET" || echo "Failed to delete $BUCKET"
+          fi
+        done
+
+    - name: 11. Delete Security Groups
+      run: |
+        echo "🧹 STEP 11: DESTROYING ALL CUSTOM SECURITY GROUPS..."
+        
+        # Get all non-default security groups
+        aws ec2 describe-security-groups --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text | tr '\t' '\n' | while read SG_ID; do
+          if [ ! -z "$SG_ID" ]; then
+            echo "Attempting to delete security group: $SG_ID"
+            
+            # Try multiple times as dependencies may need to clear
+            for i in {1..5}; do
+              if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
+                echo "  Successfully deleted: $SG_ID"
+                break
+              else
+                echo "  Attempt $i failed for $SG_ID, retrying in 30 seconds..."
+                sleep 30
+              fi
+            done
+          fi
+        done
+
+    - name: 12. Detach and Delete Internet Gateways
+      run: |
+        echo "🧹 STEP 12: DESTROYING ALL INTERNET GATEWAYS..."
+        
+        aws ec2 describe-internet-gateways --query 'InternetGateways[*].[InternetGatewayId,Attachments[0].VpcId]' --output text | while read IGW_ID VPC_ID; do
+          if [ ! -z "$IGW_ID" ] && [ "$VPC_ID" != "None" ] && [ ! -z "$VPC_ID" ]; then
+            echo "Detaching IGW $IGW_ID from VPC $VPC_ID"
+            aws ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" || echo "Failed to detach $IGW_ID"
+            sleep 10
+            
+            echo "Deleting IGW: $IGW_ID"
+            aws ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID" || echo "Failed to delete $IGW_ID"
+          fi
+        done
+
+    - name: 13. Delete Subnets
+      run: |
+        echo "🧹 STEP 13: DESTROYING ALL SUBNETS..."
+        
+        aws ec2 describe-subnets --query 'Subnets[*].SubnetId' --output text | tr '\t' '\n' | while read SUBNET_ID; do
+          if [ ! -z "$SUBNET_ID" ]; then
+            echo "Deleting subnet: $SUBNET_ID"
+            aws ec2 delete-subnet --subnet-id "$SUBNET_ID" || echo "Failed to delete $SUBNET_ID"
+          fi
+        done
+
+    - name: 14. Delete Route Tables
+      run: |
+        echo "🧹 STEP 14: DESTROYING ALL CUSTOM ROUTE TABLES..."
+        
+        # Get all route tables that are not main route tables
+        aws ec2 describe-route-tables --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text | tr '\t' '\n' | while read RT_ID; do
+          if [ ! -z "$RT_ID" ]; then
+            echo "Deleting route table: $RT_ID"
+            aws ec2 delete-route-table --route-table-id "$RT_ID" || echo "Failed to delete $RT_ID"
+          fi
+        done
+
+    - name: 15. Delete VPCs
+      run: |
+        echo "🧹 STEP 15: DESTROYING ALL NON-DEFAULT VPCs..."
+        
+        aws ec2 describe-vpcs --query 'Vpcs[?IsDefault!=`true`].VpcId' --output text | tr '\t' '\n' | while read VPC_ID; do
+          if [ ! -z "$VPC_ID" ]; then
+            echo "Deleting VPC: $VPC_ID"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" || echo "Failed to delete $VPC_ID"
+          fi
+        done
+
+    - name: 16. Cleanup CloudWatch Log Groups
+      run: |
+        echo "🧹 STEP 16: DESTROYING ALL CLOUDWATCH LOG GROUPS..."
+        
+        aws logs describe-log-groups --query 'logGroups[*].logGroupName' --output text | tr '\t' '\n' | while read LOG_GROUP; do
+          if [ ! -z "$LOG_GROUP" ]; then
+            echo "Deleting log group: $LOG_GROUP"
+            aws logs delete-log-group --log-group-name "$LOG_GROUP" || echo "Failed to delete $LOG_GROUP"
+          fi
+        done
+
+    - name: 17. Cleanup IAM User Groups
+      run: |
+        echo "🧹 STEP 17: DESTROYING ALL IAM USER GROUPS..."
+        
+        # Get all IAM groups
+        aws iam list-groups --query 'Groups[*].GroupName' --output text | tr '\t' '\n' | while read GROUP_NAME; do
+          if [ ! -z "$GROUP_NAME" ]; then
+            echo "Processing IAM group: $GROUP_NAME"
+            
+            # Remove all users from the group
+            aws iam get-group --group-name "$GROUP_NAME" --query 'Users[*].UserName' --output text | tr '\t' '\n' | while read USER_NAME; do
+              if [ ! -z "$USER_NAME" ]; then
+                echo "  Removing user $USER_NAME from group $GROUP_NAME"
+                aws iam remove-user-from-group --group-name "$GROUP_NAME" --user-name "$USER_NAME" || echo "  Failed to remove user $USER_NAME"
+              fi
+            done
+            
+            # Detach all managed policies from the group
+            aws iam list-attached-group-policies --group-name "$GROUP_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read
