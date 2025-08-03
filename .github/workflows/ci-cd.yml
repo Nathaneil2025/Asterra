@@ -580,7 +580,7 @@ jobs:
         
     - name: Test Application Endpoints
       run: |
-                echo "🔍 Testing application endpoints..."
+        echo "🔍 Testing application endpoints..."
         
         # Get WordPress URL if available
         WORDPRESS_URL="${{ needs.terraform-apply.outputs.wordpress_url }}"
