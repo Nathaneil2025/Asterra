@@ -273,6 +273,7 @@ jobs:
       run: |
         echo "🔧 Initializing Terraform with remote backend..."
         terraform init -no-color
+        echo "✅ Terraform initialization complete"
         
         # Remove any state resources that might be in the state file
         echo "🧹 Cleaning up any state resources from Terraform state..."
