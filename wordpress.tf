@@ -113,7 +113,7 @@ resource "aws_lb_listener" "wordpress" {
 # WordPress EC2 Instance
 resource "aws_instance" "wordpress" {
   ami           = "ami-01c79f8fca6bc28c3" # Example AMI, replace with a suitable WordPress AMI
-  instance_type = "t3.micro"
+  instance_type = "t4g.micro"
   subnet_id     = module.vpc.private_subnets[0]
   vpc_security_group_ids = [aws_security_group.wordpress_instance.id] # Use vpc_security_group_ids
 
