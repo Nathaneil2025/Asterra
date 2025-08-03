@@ -40,7 +40,7 @@ resource "aws_instance" "gdal_service" {
   user_data = <<-EOF
               #!/bin/bash
               sudo apt update -y
-              sudo apt -y gdal
+              sudo apt install -y gdal-bin
               # Add any additional setup or scripts here
               EOF
 }

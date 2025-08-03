@@ -126,13 +126,13 @@ resource "aws_instance" "wordpress" {
               sudo apt update -y
               sudo apt install -y httpd php php-mysql
               cd /var/www/html
-              wget https://wordpress.org/latest.tar.gz
-              tar -xzf latest.tar.gz
-              mv wordpress/* .
-              rm -rf wordpress latest.tar.gz
-              chown -R apache:apache /var/www/html
-              systemctl enable httpd
-              systemctl start httpd
+              sudo wget https://wordpress.org/latest.tar.gz
+              sudo tar -xzf latest.tar.gz
+              sudo mv wordpress/* .
+              sudo rm -rf wordpress latest.tar.gz
+              sudo chown -R apache:apache /var/www/html
+              sudo systemctl enable httpd
+              sudo systemctl start httpd
               EOF
 }
 # Attach EC2 Instance to Target Group
