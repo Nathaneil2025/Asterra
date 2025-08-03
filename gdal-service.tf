@@ -25,11 +25,13 @@ resource "aws_security_group" "gdal_service" {
 }
 
 # GDAL EC2 Instance
+
+# GDAL EC2 Instance
 resource "aws_instance" "gdal_service" {
   ami           = "ami-01c79f8fca6bc28c3" # Replace with a suitable AMI
   instance_type = "t3.micro"
   subnet_id     = module.vpc.private_subnets[0] # Deploy in a private subnet
-  security_groups = [aws_security_group.gdal_service.name]
+  vpc_security_group_ids = [aws_security_group.gdal_service.id] # Use vpc_security_group_ids
 
   tags = {
     Name = "GDAL Service Instance"
@@ -37,8 +39,8 @@ resource "aws_instance" "gdal_service" {
 
   user_data = <<-EOF
               #!/bin/bash
-              yum update -y
-              yum install -y gdal
+              sudo apt update -y
+              sudo apt -y gdal
               # Add any additional setup or scripts here
               EOF
 }

@@ -109,11 +109,13 @@ resource "aws_lb_listener" "wordpress" {
 }
 
 # WordPress EC2 Instance
+
+# WordPress EC2 Instance
 resource "aws_instance" "wordpress" {
   ami           = "ami-01c79f8fca6bc28c3" # Example AMI, replace with a suitable WordPress AMI
   instance_type = "t3.micro"
   subnet_id     = module.vpc.private_subnets[0]
-  security_groups = [aws_security_group.wordpress_instance.name]
+  vpc_security_group_ids = [aws_security_group.wordpress_instance.id] # Use vpc_security_group_ids
 
   tags = {
     Name = "WordPress Instance"
@@ -133,7 +135,6 @@ resource "aws_instance" "wordpress" {
               systemctl start httpd
               EOF
 }
-
 # Attach EC2 Instance to Target Group
 resource "aws_lb_target_group_attachment" "wordpress" {
   target_group_arn = aws_lb_target_group.wordpress.arn
