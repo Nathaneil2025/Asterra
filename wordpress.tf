@@ -11,8 +11,10 @@ resource "aws_instance" "wordpress" {
 
   user_data = <<-EOF
               #!/bin/bash
-              sudo apt update -y
-              sudo apt install -y apache2 php php-mysql libapache2-mod-php
+              sudo yum update -y
+              sudo systemctl enable ssh
+              sudo systemctl start ssh
+              sudo apt install -y httpd php php-mysqlnd php-fpm php-json php-gd php-mbstring
               cd /var/www/html
               sudo wget https://wordpress.org/latest.tar.gz
               sudo tar -xzf latest.tar.gz
