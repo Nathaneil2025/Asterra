@@ -266,9 +266,24 @@ jobs:
     - name: Deploy Application Infrastructure
       run: |
         echo "🚀 Deploying application infrastructure..."
-        terraform init  # Now uses remote state
-        terraform plan
-        terraform apply -auto-approve
+        
+        # Ensure state-setup.tf is disabled
+        if [ -f "state-setup.tf" ]; then
+          mv state-setup.tf state-setup.tf.disabled
+          echo "✅ Disabled state-setup.tf to prevent conflicts"
+        fi
+        
+        # Initialize with automatic approval for state migration
+        echo "🔧 Initializing Terraform with remote backend..."
+        echo "yes" | terraform init -input=false -no-color
+        
+        echo "📋 Creating Terraform plan..."
+        terraform plan -input=false -no-color
+        
+        echo "🚀 Applying Terraform configuration..."
+        terraform apply -auto-approve -input=false -no-color
+        
+        echo "✅ Application infrastructure deployment complete
 
     - name: Remove State Resources from Terraform Management
       run: |
