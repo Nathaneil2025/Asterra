@@ -26,7 +26,6 @@ resource "aws_instance" "wordpress" {
               EOF
 }
 
-
 # Security Group for WordPress EC2 Instance
 resource "aws_security_group" "wordpress_instance" {
   name        = "wordpress-instance-sg"
@@ -96,4 +95,64 @@ resource "aws_security_group" "alb" {
   tags = {
     Name = "WordPress ALB Security Group"
   }
+}
+
+
+# Application Load Balancer for WordPress
+resource "aws_lb" "wordpress" {
+  name               = "wordpress-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = module.vpc.public_subnets
+
+  enable_deletion_protection = false
+
+  tags = {
+    Name = "WordPress ALB"
+  }
+}
+
+# ALB Listener
+resource "aws_lb_listener" "wordpress" {
+  load_balancer_arn = aws_lb.wordpress.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.wordpress.arn
+  }
+}
+
+# Target Group for WordPress
+resource "aws_lb_target_group" "wordpress" {
+  name        = "wordpress-tg"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = module.vpc.vpc_id
+  target_type = "instance"
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    interval            = 30
+    matcher             = "200,302"
+    path                = "/"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    timeout             = 5
+    unhealthy_threshold = 2
+  }
+
+  tags = {
+    Name = "WordPress Target Group"
+  }
+}
+
+# Attach EC2 Instance to Target Group
+resource "aws_lb_target_group_attachment" "wordpress" {
+  target_group_arn = aws_lb_target_group.wordpress.arn
+  target_id        = aws_instance.wordpress.id
+  port             = 80
 }

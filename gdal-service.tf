@@ -30,7 +30,7 @@ resource "aws_instance" "gdal_service" {
   instance_type = "t4g.micro"
   subnet_id     = module.vpc.private_subnets[0] # Deploy in a private subnet
   vpc_security_group_ids = [aws_security_group.gdal_service.id] # Use vpc_security_group_ids
-
+  key_name = "Frankfurt"
   tags = {
     Name = "GDAL Service Instance"
   }
@@ -39,6 +39,10 @@ resource "aws_instance" "gdal_service" {
               #!/bin/bash
               sudo apt update -y
               sudo apt install -y gdal-bin
+              sudo systemctl enable ssh
+              sudo systemctl start ssh
+              # Install GDAL and other dependencies here
+              # For example, you can use the following command to install GDAL and its dependencies:
               # Add any additional setup or scripts here
               EOF
 }
