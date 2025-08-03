@@ -696,6 +696,19 @@ jobs:
       with:
         script: |
           const title = `🚨 Deployment Failed - ${new Date().toISOString().split('T')[0]}`;
+          
+          // Build failed jobs list
+          let failedJobs = [];
+          if ('${{ needs.terraform-apply.result }}' === 'failure') {
+            failedJobs.push('❌ Terraform Apply');
+          }
+          if ('${{ needs.build-and-deploy.result }}' === 'failure') {
+            failedJobs.push('❌ Build and Deploy GeoJSON Processor');
+          }
+          if ('${{ needs.deploy-wordpress.result }}' === 'failure') {
+            failedJobs.push('❌ Deploy WordPress');
+          }
+          
           const body = `## Deployment Failure Report
           
           **Workflow Run**: [${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})
@@ -704,9 +717,7 @@ jobs:
           **Triggered by**: @${context.actor}
           
           ### Failed Jobs:
-          ${{ needs.terraform-apply.result == 'failure' ? '❌ Terraform Apply\n' : '' }}
-          ${{ needs.build-and-deploy.result == 'failure' ? '❌ Build and Deploy GeoJSON Processor\n' : '' }}
-          ${{ needs.deploy-wordpress.result == 'failure' ? '❌ Deploy WordPress\n' : '' }}
+          ${failedJobs.join('\n')}
           
           ### Next Steps:
           1. Check the workflow logs for detailed error messages
