@@ -1,4 +1,204 @@
-        aws rds describe-db-parameter-groups --query 'DBParameterGroups[?!starts_with(DBParameterGroupName, `default.`)].DBParameterGroupName' --output text | tr '\t' '\n' | while read PG; do
+name: Nuclear Cleanup - Destroy ALL AWS Resources
+
+on:
+  workflow_dispatch:  # Manual trigger only
+    inputs:
+      confirm_destroy:
+        description: 'Type "NUCLEAR" to confirm complete destruction'
+        required: true
+        default: ''
+
+jobs:
+  nuclear-cleanup:
+    name: Complete AWS Resource Destruction
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm_destroy == 'NUCLEAR'
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: List all resources before destruction
+      run: |
+        echo "🔍 SCANNING ALL AWS RESOURCES BEFORE DESTRUCTION..."
+        echo "=================================================="
+        
+        echo "=== EC2 INSTANCES ==="
+        aws ec2 describe-instances --query 'Reservations[*].Instances[*].[InstanceId,State.Name,Tags[?Key==`Name`].Value|[0],InstanceType]' --output table || echo "No instances"
+        
+        echo "=== RDS INSTANCES ==="
+        aws rds describe-db-instances --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceStatus,Engine]' --output table || echo "No RDS instances"
+        
+        echo "=== S3 BUCKETS ==="
+        aws s3 ls || echo "No buckets"
+        
+        echo "=== ECR REPOSITORIES ==="
+        aws ecr describe-repositories --query 'repositories[*].[repositoryName,repositoryUri]' --output table || echo "No ECR repos"
+        
+        echo "=== ECS CLUSTERS ==="
+        aws ecs list-clusters --query 'clusterArns' --output table || echo "No ECS clusters"
+        
+        echo "=== LAMBDA FUNCTIONS ==="
+        aws lambda list-functions --query 'Functions[*].[FunctionName,Runtime]' --output table || echo "No Lambda functions"
+        
+        echo "=== LOAD BALANCERS ==="
+        aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerName,Type,State.Code]' --output table || echo "No ALBs"
+        aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].[LoadBalancerName,Scheme]' --output table || echo "No Classic ELBs"
+        
+        echo "=== VPCs ==="
+        aws ec2 describe-vpcs --query 'Vpcs[*].[VpcId,IsDefault,State,Tags[?Key==`Name`].Value|[0]]' --output table || echo "No VPCs"
+        
+        echo "=== NAT GATEWAYS ==="
+        aws ec2 describe-nat-gateways --query 'NatGateways[*].[NatGatewayId,State,VpcId]' --output table || echo "No NAT Gateways"
+        
+        echo "=== INTERNET GATEWAYS ==="
+        aws ec2 describe-internet-gateways --query 'InternetGateways[*].[InternetGatewayId,Attachments[0].VpcId,Attachments[0].State]' --output table || echo "No IGWs"
+        
+        echo "=== ELASTIC IPs ==="
+        aws ec2 describe-addresses --query 'Addresses[*].[PublicIp,AllocationId,AssociationId,InstanceId]' --output table || echo "No Elastic IPs"
+        
+        echo "=== SECURITY GROUPS ==="
+        aws ec2 describe-security-groups --query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName,VpcId]' --output table || echo "No custom security groups"
+        
+        echo "=== IAM USER GROUPS ==="
+        aws iam list-groups --query 'Groups[*].[GroupName,CreateDate]' --output table || echo "No IAM groups"
+
+    - name: 1. Terminate ALL EC2 Instances FIRST
+      run: |
+        echo "🧹 STEP 1: TERMINATING ALL EC2 INSTANCES FIRST..."
+        echo "This must be done first to release dependencies on NAT Gateways and Elastic IPs"
+        
+        aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text | tr '\t' '\n' | while read INSTANCE_ID; do
+          if [ ! -z "$INSTANCE_ID" ]; then
+            echo "Terminating instance: $INSTANCE_ID"
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
+          fi
+        done
+
+    - name: 2. Wait for instances to terminate
+      run: |
+        echo "⏳ STEP 2: WAITING FOR ALL INSTANCES TO FULLY TERMINATE..."
+        echo "This ensures all dependencies are released before proceeding"
+        
+        # Get list of instances that need to terminate
+        INSTANCE_IDS=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping,shutting-down" --query 'Reservations[*].Instances[*].InstanceId' --output text)
+        
+        if [ ! -z "$INSTANCE_IDS" ]; then
+          echo "Waiting for instances to terminate: $INSTANCE_IDS"
+          echo "This may take several minutes..."
+          aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS || echo "Wait completed or no instances to wait for"
+        else
+          echo "No instances found to wait for"
+        fi
+        
+        echo "✅ All instances terminated!"
+
+    - name: 3. Release ALL Elastic IPs
+      run: |
+        echo "🧹 STEP 3: RELEASING ALL ELASTIC IPs..."
+        echo "Now that instances are terminated, we can safely release Elastic IPs"
+        
+        aws ec2 describe-addresses --query 'Addresses[*].[AllocationId,AssociationId,PublicIp]' --output text | while read ALLOCATION_ID ASSOCIATION_ID PUBLIC_IP; do
+          if [ ! -z "$ALLOCATION_ID" ]; then
+            echo "Processing Elastic IP: $PUBLIC_IP (Allocation: $ALLOCATION_ID)"
+            
+            # Disassociate if still associated (shouldn't be after instance termination)
+            if [ ! -z "$ASSOCIATION_ID" ] && [ "$ASSOCIATION_ID" != "None" ]; then
+              echo "  Disassociating from: $ASSOCIATION_ID"
+              aws ec2 disassociate-address --association-id "$ASSOCIATION_ID" || echo "  Failed to disassociate"
+              sleep 5
+            fi
+            
+            # Release the Elastic IP
+            echo "  Releasing Elastic IP: $PUBLIC_IP"
+            aws ec2 release-address --allocation-id "$ALLOCATION_ID" || echo "  Failed to release $ALLOCATION_ID"
+          fi
+        done
+
+    - name: 4. Delete NAT Gateways
+      run: |
+        echo "🧹 STEP 4: DESTROYING ALL NAT GATEWAYS..."
+        echo "Now that instances and Elastic IPs are cleaned up, we can delete NAT Gateways"
+        
+        aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" --query 'NatGateways[*].NatGatewayId' --output text | tr '\t' '\n' | while read NAT_GW_ID; do
+          if [ ! -z "$NAT_GW_ID" ]; then
+            echo "Deleting NAT Gateway: $NAT_GW_ID"
+            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_GW_ID" || echo "Failed to delete $NAT_GW_ID"
+          fi
+        done
+        
+        # Wait for NAT Gateways to be deleted
+        echo "Waiting for NAT Gateways to be deleted..."
+        sleep 60
+
+    - name: 5. Cleanup Lambda Functions
+      run: |
+        echo "🧹 STEP 5: DESTROYING ALL LAMBDA FUNCTIONS..."
+        aws lambda list-functions --query 'Functions[*].FunctionName' --output text | tr '\t' '\n' | while read FUNC; do
+          if [ ! -z "$FUNC" ]; then
+            echo "Deleting Lambda function: $FUNC"
+            aws lambda delete-function --function-name "$FUNC" || echo "Failed to delete $FUNC"
+          fi
+        done
+
+    - name: 6. Cleanup ECR Repositories
+      run: |
+        echo "🧹 STEP 6: DESTROYING ALL ECR REPOSITORIES..."
+        aws ecr describe-repositories --query 'repositories[*].repositoryName' --output text | tr '\t' '\n' | while read REPO; do
+          if [ ! -z "$REPO" ]; then
+            echo "Deleting ECR repository: $REPO"
+            aws ecr delete-repository --repository-name "$REPO" --force || echo "Failed to delete $REPO"
+          fi
+        done
+
+    - name: 7. Cleanup ECS Resources
+      run: |
+        echo "🧹 STEP 7: DESTROYING ALL ECS RESOURCES..."
+        
+        # Get all clusters
+        aws ecs list-clusters --query 'clusterArns' --output text | tr '\t' '\n' | while read CLUSTER_ARN; do
+          if [ ! -z "$CLUSTER_ARN" ]; then
+            CLUSTER_NAME=$(basename "$CLUSTER_ARN")
+            echo "Processing ECS cluster: $CLUSTER_NAME"
+            
+            # Stop all services in cluster
+            aws ecs list-services --cluster "$CLUSTER_NAME" --query 'serviceArns' --output text | tr '\t' '\n' | while read SERVICE_ARN; do
+              if [ ! -z "$SERVICE_ARN" ]; then
+                SERVICE_NAME=$(basename "$SERVICE_ARN")
+                echo "Stopping service: $SERVICE_NAME"
+                aws ecs update-service --cluster "$CLUSTER_NAME" --service "$SERVICE_NAME" --desired-count 0 || echo "Failed to stop $SERVICE_NAME"
+                sleep 10
+                aws ecs delete-service --cluster "$CLUSTER_NAME" --service "$SERVICE_NAME" || echo "Failed to delete $SERVICE_NAME"
+              fi
+            done
+            
+            # Delete cluster
+            echo "Deleting cluster: $CLUSTER_NAME"
+            aws ecs delete-cluster --cluster "$CLUSTER_NAME" || echo "Failed to delete cluster"
+          fi
+        done
+
+    - name: 8. Cleanup RDS Resources
+      run: |
+        echo "🧹 STEP 8: DESTROYING ALL RDS RESOURCES..."
+        
+        # Delete all DB instances
+        aws rds describe-db-instances --query 'DBInstances[*].DBInstanceIdentifier' --output text | tr '\t' '\n' | while read DB; do
+          if [ ! -z "$DB" ]; then
+            echo "Deleting RDS instance: $DB"
+            aws rds delete-db-instance --db-instance-identifier "$DB" --skip-final-snapshot || echo "Failed to delete $DB"
+          fi
+        done
+        
+        # Wait for DB instances to start deleting
+        sleep 30
+        
+        # Delete parameter groups
+                aws rds describe-db-parameter-groups --query 'DBParameterGroups[?!starts_with(DBParameterGroupName, `default.`)].DBParameterGroupName' --output text | tr '\t' '\n' | while read PG; do
           if [ ! -z "$PG" ]; then
             echo "Deleting parameter group: $PG"
             aws rds delete-db-parameter-group --db-parameter-group-name "$PG" || echo "Failed to delete $PG"
