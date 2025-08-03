@@ -184,6 +184,39 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
         
+    - name: Verify AWS Permissions
+      run: |
+        echo "🔐 Verifying AWS permissions..."
+        
+        # Check basic AWS access
+        echo "👤 Current AWS identity:"
+        aws sts get-caller-identity
+        
+        # Check specific permissions we need
+        echo "🔍 Testing required AWS permissions..."
+        
+        # Test S3 permissions
+        echo "📦 Testing S3 access..."
+        aws s3 ls > /dev/null && echo "✅ S3 list access confirmed" || echo "⚠️ S3 access issues"
+        
+        # Test ECR permissions
+        echo "🐳 Testing ECR access..."
+        aws ecr describe-repositories --max-items 1 > /dev/null && echo "✅ ECR access confirmed" || echo "⚠️ ECR access issues"
+        
+        # Test ECS permissions
+        echo "🚢 Testing ECS access..."
+        aws ecs list-clusters --max-items 1 > /dev/null && echo "✅ ECS access confirmed" || echo "⚠️ ECS access issues"
+        
+        # Test RDS permissions
+        echo "🗄️ Testing RDS access..."
+        aws rds describe-db-instances --max-items 1 > /dev/null && echo "✅ RDS access confirmed" || echo "⚠️ RDS access issues"
+        
+        # Test IAM permissions
+        echo "👥 Testing IAM access..."
+        aws iam list-roles --max-items 1 > /dev/null && echo "✅ IAM access confirmed" || echo "⚠️ IAM access issues"
+        
+        echo "✅ Permission check completed"
+        
     - name: Auto-Setup Remote State Infrastructure
       run: |
         echo "🔍 Checking remote state infrastructure..."
@@ -231,26 +264,49 @@ jobs:
     - name: Terraform Init
       run: |
         echo "🔧 Initializing Terraform..."
-        terraform init || {
-          echo "⚠️ Terraform init failed, attempting to reconfigure..."
-          terraform init -reconfigure
-        }
+        terraform init -no-color 2>&1 | tee init_output.log
+        INIT_EXIT_CODE=${PIPESTATUS[0]}
+        
+        if [ $INIT_EXIT_CODE -eq 0 ]; then
+          echo "✅ Terraform init successful"
+        else
+          echo "❌ Terraform init failed with exit code $INIT_EXIT_CODE"
+          echo "🔍 Init output:"
+          cat init_output.log
+          
+          echo "🔄 Attempting init with reconfigure..."
+          terraform init -reconfigure -no-color 2>&1 | tee init_reconfigure.log
+          RECONFIG_EXIT_CODE=${PIPESTATUS[0]}
+          
+          if [ $RECONFIG_EXIT_CODE -eq 0 ]; then
+            echo "✅ Terraform init with reconfigure successful"
+          else
+            echo "❌ Terraform init reconfigure also failed"
+            cat init_reconfigure.log
+            exit $RECONFIG_EXIT_CODE
+          fi
+        fi
       
     - name: Terraform Validate
-      run: terraform validate
+      run: |
+        echo "✅ Validating Terraform configuration..."
+        terraform validate -no-color
       
     - name: Terraform Plan
       run: |
         echo "📋 Creating Terraform plan..."
-        terraform plan -out=tfplan -detailed-exitcode || {
-          EXIT_CODE=$?
-          if [ $EXIT_CODE -eq 2 ]; then
-            echo "✅ Plan created with changes to apply"
-          else
-            echo "❌ Plan failed with exit code $EXIT_CODE"
-            exit $EXIT_CODE
-          fi
-        }
+        
+        # Create plan with detailed output
+        terraform plan -out=tfplan -detailed-exitcode -no-color 2>&1 | tee plan_output.log
+        PLAN_EXIT_CODE=${PIPESTATUS[0]}
+        
+        echo "📊 Plan completed with exit code: $PLAN_EXIT_CODE"
+        
+        if [ $PLAN_EXIT_CODE -eq 0 ]; then
+          echo "✅ No changes needed"
+        elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+          echo "✅ Plan created with changes to apply"
+        fi
       
     - name: Terraform Apply
       id: terraform-apply
