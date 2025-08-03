@@ -215,75 +215,74 @@ jobs:
         
         echo "✅ Permission check completed"
         
-    - name: Auto-Setup Remote State Infrastructure
+    - name: Setup State Infrastructure
       run: |
-        echo "🔍 Checking remote state infrastructure..."
+        echo "🔍 Checking if state infrastructure exists..."
         
-        # Check if S3 bucket exists
-        if aws s3 ls s3://terraform-state-asterra-project/ > /dev/null 2>&1; then
-          echo "✅ S3 bucket already exists"
-          S3_EXISTS=true
+        # Check if both S3 bucket and DynamoDB table exist
+        if aws s3 ls s3://terraform-state-asterra-project/ > /dev/null 2>&1 && \
+           aws dynamodb describe-table --table-name terraform-state-lock --region eu-central-1 > /dev/null 2>&1; then
+          echo "✅ State infrastructure exists - skipping creation"
         else
-          echo "📦 S3 bucket not found - will create"
-          S3_EXISTS=false
+          echo "🏗️ Creating state infrastructure..."
+          
+          # Temporarily uncomment the state resources in backend.tf
+          sed -i 's/^# resource "aws_s3_bucket" "terraform_state"/resource "aws_s3_bucket" "terraform_state"/' backend.tf
+          sed -i 's/^# resource "aws_s3_bucket_versioning"/resource "aws_s3_bucket_versioning"/' backend.tf
+          sed -i 's/^# resource "aws_s3_bucket_server_side_encryption_configuration"/resource "aws_s3_bucket_server_side_encryption_configuration"/' backend.tf
+          sed -i 's/^# resource "aws_s3_bucket_public_access_block"/resource "aws_s3_bucket_public_access_block"/' backend.tf
+          sed -i 's/^# resource "aws_dynamodb_table"/resource "aws_dynamodb_table"/' backend.tf
+          sed -i 's/^#   /  /g' backend.tf
+          sed -i 's/^# }/}/g' backend.tf
+          
+          # Comment out the backend configuration temporarily
+          sed -i 's/^terraform {/# terraform {/' backend.tf
+          sed -i 's/^  backend "s3"/# backend "s3"/' backend.tf
+          sed -i '/^  backend "s3"/,/^  }/s/^/# /' backend.tf
+          
+          # Create state infrastructure with local state
+          terraform init
+          terraform apply -auto-approve -target=aws_s3_bucket.terraform_state -target=aws_dynamodb_table.terraform_state_lock
+          
+          # Restore backend configuration and comment out state resources
+          git checkout backend.tf
+          
+          echo "✅ State infrastructure created"
+        fi
+
+    - name: Deploy Application Infrastructure
+      run: |
+        echo "🚀 Deploying application infrastructure..."
+        terraform init  # Now uses remote state
+        terraform plan
+        terraform apply -auto-approve
+
+    - name: Remove State Resources from Terraform Management
+      run: |
+        echo "🧹 Ensuring state infrastructure is not managed by main configuration..."
+        
+        # Disable state-setup.tf if it exists
+        if [ -f "state-setup.tf" ]; then
+          mv state-setup.tf state-setup.tf.disabled
+          echo "✅ Disabled state-setup.tf to prevent conflicts"
         fi
         
-        # Check if DynamoDB table exists
-        if aws dynamodb describe-table --table-name terraform-state-lock --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
-          echo "✅ DynamoDB lock table already exists"
-          DYNAMO_EXISTS=true
-        else
-          echo "🔒 DynamoDB lock table not found - will create"
-          DYNAMO_EXISTS=false
-        fi
-        
-        # If either doesn't exist, run the setup
-        if [ "$S3_EXISTS" = false ] || [ "$DYNAMO_EXISTS" = false ]; then
-          echo "🚀 Setting up remote state infrastructure automatically..."
-          
-          # Make script executable
-          chmod +x quick-remote-state-setup.sh
-          
-          # Run the setup script non-interactively
-          echo "yes" | ./quick-remote-state-setup.sh || {
-            echo "⚠️ Remote state setup encountered issues, but continuing..."
-            echo "This might be due to resources already existing"
-          }
-          
-          echo "✅ Remote state infrastructure setup completed"
-          
-          # Wait a moment for AWS resources to be fully available
-          echo "⏳ Waiting for resources to be fully available..."
-          sleep 10
-        else
-          echo "✅ Remote state infrastructure already exists - skipping setup"
-        fi
-        
+        echo "✅ State infrastructure removed from main configuration management"
+
     - name: Terraform Init
       run: |
-        echo "🔧 Initializing Terraform..."
-        terraform init -no-color 2>&1 | tee init_output.log
-        INIT_EXIT_CODE=${PIPESTATUS[0]}
+        echo "🔧 Initializing Terraform with remote backend..."
+        terraform init -no-color
         
-        if [ $INIT_EXIT_CODE -eq 0 ]; then
-          echo "✅ Terraform init successful"
-        else
-          echo "❌ Terraform init failed with exit code $INIT_EXIT_CODE"
-          echo "🔍 Init output:"
-          cat init_output.log
-          
-          echo "🔄 Attempting init with reconfigure..."
-          terraform init -reconfigure -no-color 2>&1 | tee init_reconfigure.log
-          RECONFIG_EXIT_CODE=${PIPESTATUS[0]}
-          
-          if [ $RECONFIG_EXIT_CODE -eq 0 ]; then
-            echo "✅ Terraform init with reconfigure successful"
-          else
-            echo "❌ Terraform init reconfigure also failed"
-            cat init_reconfigure.log
-            exit $RECONFIG_EXIT_CODE
-          fi
-        fi
+        # Remove any state resources that might be in the state file
+        echo "🧹 Cleaning up any state resources from Terraform state..."
+        terraform state rm aws_s3_bucket.terraform_state 2>/dev/null || echo "S3 bucket not in state"
+        terraform state rm aws_dynamodb_table.terraform_state_lock 2>/dev/null || echo "DynamoDB table not in state"
+        terraform state rm aws_s3_bucket_versioning.terraform_state 2>/dev/null || echo "S3 versioning not in state"
+        terraform state rm aws_s3_bucket_server_side_encryption_configuration.terraform_state 2>/dev/null || echo "S3 encryption not in state"
+        terraform state rm aws_s3_bucket_public_access_block.terraform_state 2>/dev/null || echo "S3 public access block not in state"
+        
+        echo "✅ Terraform initialization complete"
       
     - name: Terraform Validate
       run: |
