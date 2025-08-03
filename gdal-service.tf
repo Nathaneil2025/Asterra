@@ -37,10 +37,10 @@ resource "aws_instance" "gdal_service" {
 
   user_data = <<-EOF
               #!/bin/bash
-              sudo apt update -y
-              sudo apt install -y gdal-bin
-              sudo systemctl enable ssh
-              sudo systemctl start ssh
+              sudo yum update -y
+              sudo yum pixi global install gdal
+              sudo pixi global install libgdal-core
+              sudo pixi global install libgdal-arrow-parquet
               # Install GDAL and other dependencies here
               # For example, you can use the following command to install GDAL and its dependencies:
               # Add any additional setup or scripts here

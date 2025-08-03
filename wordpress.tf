@@ -4,7 +4,7 @@ resource "aws_instance" "wordpress" {
   instance_type = "t4g.micro"
   subnet_id     = module.vpc.private_subnets[0]
   vpc_security_group_ids = [aws_security_group.wordpress_instance.id] # Use vpc_security_group_ids
-
+  key_name      = "Frankfurt" # Specify the key pair
   tags = {
     Name = "WordPress Instance"
   }
@@ -14,16 +14,18 @@ resource "aws_instance" "wordpress" {
               sudo yum update -y
               sudo systemctl enable ssh
               sudo systemctl start ssh
-              sudo apt install -y httpd php php-mysqlnd php-fpm php-json php-gd php-mbstring
+              sudo wget https://github.com/WordPress/WordPress/archive/master.zip
+              sudo unzip master -d /tmp/WordPress_Temp
+              mkdir -p /tmp/WordPress
+              cp -paf /tmp/WordPress_Temp/WordPress-master/* /tmp/WordPress
+              rm -rf /tmp/WordPress_Temp
+              rm -f master
               cd /var/www/html
-              sudo wget https://wordpress.org/latest.tar.gz
-              sudo tar -xzf latest.tar.gz
-              sudo mv wordpress/* .
-              sudo rm -rf wordpress latest.tar.gz
               sudo chown -R www-data:www-data /var/www/html
               sudo systemctl enable apache2
               sudo systemctl start apache2
               EOF
+              
 }
 
 # Security Group for WordPress EC2 Instance
