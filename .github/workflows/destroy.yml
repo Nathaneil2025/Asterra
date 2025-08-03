@@ -1,18 +1,308 @@
-name: Nuclear Cleanup - Destroy ALL AWS Resources
+name: 🗑️ Destroy Infrastructure
 
 on:
-  workflow_dispatch:  # Manual trigger only
+  workflow_dispatch:
     inputs:
       confirm_destroy:
-        description: 'Type "NUCLEAR" to confirm complete destruction'
+        description: 'Type "DESTROY" to confirm complete infrastructure destruction'
         required: true
-        default: ''
+        type: string
+      destroy_state_infrastructure:
+        description: 'Also destroy state infrastructure (S3 bucket and DynamoDB table)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: eu-central-1
 
 jobs:
-  nuclear-cleanup:
-    name: Complete AWS Resource Destruction
+  validate-destroy:
+    name: Validate Destroy Request
     runs-on: ubuntu-latest
-    if: github.event.inputs.confirm_destroy == 'NUCLEAR'
+    
+    steps:
+    - name: Validate Confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+          echo "❌ Destroy confirmation failed. You must type 'DESTROY' exactly."
+          echo "   Provided: '${{ github.event.inputs.confirm_destroy }}'"
+          exit 1
+        fi
+        echo "✅ Destroy confirmation validated"
+        
+    - name: Display Destroy Plan
+      run: |
+        echo "🚨 DESTRUCTION PLAN 🚨"
+        echo "======================"
+        echo ""
+        echo "The following will be PERMANENTLY DESTROYED:"
+        echo ""
+        echo "📦 APPLICATION INFRASTRUCTURE:"
+        echo "  • ECS Cluster and Services (GeoJSON Processor, WordPress)"
+        echo "  • ECR Repository and all Docker images"
+        echo "  • RDS Database and all data"
+        echo "  • VPC, Subnets, Security Groups, NAT Gateways"
+        echo "  • Load Balancers and Target Groups"
+        echo "  • IAM Roles and Policies"
+        echo "  • Lambda Functions"
+        echo "  • S3 Buckets (except state bucket)"
+        echo "  • CloudWatch Log Groups"
+        echo ""
+        if [ "${{ github.event.inputs.destroy_state_infrastructure }}" = "true" ]; then
+          echo "🗄️ STATE INFRASTRUCTURE (ALSO SELECTED FOR DESTRUCTION):"
+          echo "  • Terraform State S3 Bucket"
+          echo "  • DynamoDB State Lock Table"
+          echo "  • ALL TERRAFORM STATE HISTORY WILL BE LOST!"
+          echo ""
+          echo "⚠️  WARNING: Destroying state infrastructure means you cannot"
+          echo "    track or manage any remaining resources with Terraform!"
+        else
+          echo "🗄️ STATE INFRASTRUCTURE (WILL BE PRESERVED):"
+          echo "  • Terraform State S3 Bucket (preserved)"
+          echo "  • DynamoDB State Lock Table (preserved)"
+        fi
+        echo ""
+        echo "⚠️  THIS ACTION CANNOT BE UNDONE!"
+        echo "⚠️  ALL DATA WILL BE PERMANENTLY LOST!"
+        echo ""
+        echo "Triggered by: @${{ github.actor }}"
+        echo "Repository: ${{ github.repository }}"
+        echo "Workflow: ${{ github.workflow }}"
+
+  destroy-application:
+    name: Destroy Application Infrastructure
+    needs: validate-destroy
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.12.2
+        terraform_wrapper: false
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Verify AWS Access
+      run: |
+        echo "🔐 Verifying AWS access..."
+        aws sts get-caller-identity
+        echo "✅ AWS access confirmed"
+        
+    - name: Prepare for Destruction
+      run: |
+        echo "🔧 Preparing Terraform for destruction..."
+        
+        # Ensure state-setup.tf is disabled to avoid conflicts
+        if [ -f "state-setup.tf" ]; then
+          mv state-setup.tf state-setup.tf.disabled
+          echo "✅ Disabled state-setup.tf"
+        fi
+        
+        # Ensure backend.tf is enabled for remote state access
+        if [ -f "backend.tf.disabled" ]; then
+          mv backend.tf.disabled backend.tf
+          echo "✅ Enabled backend.tf"
+        fi
+        
+    - name: Initialize Terraform
+      run: |
+        echo "🔧 Initializing Terraform with remote state..."
+        terraform init -input=false -no-color
+        echo "✅ Terraform initialized"
+        
+    - name: Show Current State
+      run: |
+        echo "📋 Current Terraform state:"
+        echo "=========================="
+        terraform state list || echo "No resources in state"
+        echo ""
+        echo "📊 Resource count:"
+        terraform state list | wc -l || echo "0"
+        
+    - name: Create Destroy Plan
+      run: |
+        echo "📋 Creating destruction plan..."
+        terraform plan -destroy -out=destroy.tfplan -input=false -no-color
+        echo "✅ Destroy plan created"
+        
+    - name: Show Destroy Plan Summary
+      run: |
+        echo "📊 DESTROY PLAN SUMMARY:"
+        echo "======================="
+        terraform show -no-color destroy.tfplan | grep -E "(Plan:|will be destroyed)" || echo "No resources to destroy"
+        
+    - name: Apply Destroy Plan
+      run: |
+        echo "🗑️ DESTROYING APPLICATION INFRASTRUCTURE..."
+        echo "=========================================="
+        
+        # Apply destroy plan with detailed logging
+        terraform apply destroy.tfplan -no-color 2>&1 | tee destroy.log
+        
+        echo ""
+        echo "✅ Application infrastructure destruction completed"
+        
+    - name: Verify Destruction
+      run: |
+        echo "🔍 Verifying destruction..."
+        
+        REMAINING_RESOURCES=$(terraform state list | wc -l)
+        echo "Remaining resources in state: $REMAINING_RESOURCES"
+        
+        if [ "$REMAINING_RESOURCES" -eq 0 ]; then
+          echo "✅ All application resources successfully destroyed"
+        else
+          echo "⚠️ Some resources remain in state:"
+          terraform state list
+          echo ""
+          echo "This might be normal if state infrastructure is preserved"
+        fi
+        
+    - name: Upload Destroy Log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: destroy-log
+        path: destroy.log
+        retention-days: 30
+
+  destroy-state-infrastructure:
+    name: Destroy State Infrastructure
+    needs: destroy-application
+    runs-on: ubuntu-latest
+    if: github.event.inputs.destroy_state_infrastructure == 'true'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.12.2
+        terraform_wrapper: false
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Final Warning
+      run: |
+        echo "🚨 FINAL WARNING - DESTROYING STATE INFRASTRUCTURE 🚨"
+        echo "===================================================="
+        echo ""
+        echo "This will destroy:"
+        echo "  • S3 bucket: terraform-state-asterra-project"
+        echo "  • DynamoDB table: terraform-state-lock"
+        echo "  • ALL Terraform state history"
+        echo ""
+        echo "After this, you will NOT be able to:"
+        echo "  • Track any remaining AWS resources with Terraform"
+        echo "  • Use Terraform to manage this infrastructure"
+        echo "  • Recover any state information"
+        echo ""
+        echo "Proceeding in 10 seconds..."
+        sleep 10
+        
+    - name: Download State File
+      run: |
+        echo "💾 Downloading current state file as backup..."
+        aws s3 cp s3://terraform-state-asterra-project/geojson-processor/terraform.tfstate ./terraform.tfstate.backup || echo "No state file found"
+        
+    - name: Prepare State Infrastructure Destruction
+      run: |
+        echo "🔧 Preparing for state infrastructure destruction..."
+        
+        # Enable state-setup.tf for destruction
+        if [ -f "state-setup.tf.disabled" ]; then
+          mv state-setup.tf.disabled state-setup.tf
+          echo "✅ Enabled state-setup.tf"
+        fi
+        
+        # Disable backend.tf to use local state for destruction
+        if [ -f "backend.tf" ]; then
+          mv backend.tf backend.tf.disabled
+          echo "✅ Disabled backend.tf"
+        fi
+        
+    - name: Initialize Local State
+      run: |
+        echo "🔧 Initializing Terraform with local state..."
+        terraform init -input=false -no-color
+        
+    - name: Import State Infrastructure
+      run: |
+        echo "📥 Importing state infrastructure into local state..."
+        
+        # Import S3 bucket
+        terraform import aws_s3_bucket.terraform_state terraform-state-asterra-project || echo "S3 bucket import failed or doesn't exist"
+        
+        # Import DynamoDB table
+        terraform import aws_dynamodb_table.terraform_state_lock terraform-state-lock || echo "DynamoDB table import failed or doesn't exist"
+        
+        # Import other state resources if they exist
+        terraform import aws_s3_bucket_versioning.terraform_state terraform-state-asterra-project || echo "S3 versioning import failed"
+        terraform import aws_s3_bucket_server_side_encryption_configuration.terraform_state terraform-state-asterra-project || echo "S3 encryption import failed"
+        terraform import aws_s3_bucket_public_access_block.terraform_state terraform-state-asterra-project || echo "S3 public access block import failed"
+        
+    - name: Destroy State Infrastructure
+      run: |
+        echo "🗑️ DESTROYING STATE INFRASTRUCTURE..."
+        echo "===================================="
+        
+        # Force destroy S3 bucket (even if not empty)
+        echo "🗑️ Force destroying S3 bucket contents..."
+        aws s3 rm s3://terraform-state-asterra-project --recursive || echo "S3 bucket already empty or doesn't exist"
+        
+        # Destroy with Terraform
+        terraform destroy -auto-approve -input=false -no-color
+        
+        echo "✅ State infrastructure destruction completed"
+        
+    - name: Verify Complete Destruction
+      run: |
+        echo "🔍 Verifying complete destruction..."
+        
+        # Check S3 bucket
+        if aws s3 ls s3://terraform-state-asterra-project/ 2>/dev/null; then
+          echo "⚠️ S3 bucket still exists"
+        else
+          echo "✅ S3 bucket destroyed"
+        fi
+        
+        # Check DynamoDB table
+        if aws dynamodb describe-table --table-name terraform-state-lock --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "⚠️ DynamoDB table still exists"
+        else
+          echo "✅ DynamoDB table destroyed"
+        fi
+        
+    - name: Upload State Backup
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-state-backup
+        path: terraform.tfstate.backup
+        retention-days: 90
+
+    cleanup-verification:
+    name: Final Cleanup Verification
+    needs: [destroy-application, destroy-state-infrastructure]
+    runs-on: ubuntu-latest
+    if: always()
     
     steps:
     - name: Configure AWS credentials
@@ -20,555 +310,88 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: ${{ env.AWS_REGION }}
         
-    - name: List all resources before destruction
+    - name: Final AWS Resource Check
       run: |
-        echo "🔍 SCANNING ALL AWS RESOURCES BEFORE DESTRUCTION..."
-        echo "=================================================="
+        echo "🔍 FINAL CLEANUP VERIFICATION"
+        echo "============================"
+        echo ""
         
-        echo "=== EC2 INSTANCES ==="
-        aws ec2 describe-instances --query 'Reservations[*].Instances[*].[InstanceId,State.Name,Tags[?Key==`Name`].Value|[0],InstanceType]' --output table || echo "No instances"
+        # Check for any remaining resources that might have been missed
+        echo "🔍 Checking for remaining AWS resources..."
         
-        echo "=== RDS INSTANCES ==="
-        aws rds describe-db-instances --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceStatus,Engine]' --output table || echo "No RDS instances"
+        # Check ECS clusters
+        echo "📦 ECS Clusters:"
+        aws ecs list-clusters --query 'clusterArns[?contains(@, `geojson`) || contains(@, `wordpress`)]' --output table || echo "No ECS clusters found"
         
-        echo "=== S3 BUCKETS ==="
-        aws s3 ls || echo "No buckets"
+        # Check ECR repositories
+        echo "🐳 ECR Repositories:"
+        aws ecr describe-repositories --query 'repositories[?contains(repositoryName, `geojson`) || contains(repositoryName, `wordpress`)].repositoryName' --output table || echo "No ECR repositories found"
         
-        echo "=== ECR REPOSITORIES ==="
-        aws ecr describe-repositories --query 'repositories[*].[repositoryName,repositoryUri]' --output table || echo "No ECR repos"
+        # Check RDS instances
+        echo "🗄️ RDS Instances:"
+        aws rds describe-db-instances --query 'DBInstances[?contains(DBInstanceIdentifier, `geojson`) || contains(DBInstanceIdentifier, `wordpress`)].DBInstanceIdentifier' --output table || echo "No RDS instances found"
         
-        echo "=== ECS CLUSTERS ==="
-        aws ecs list-clusters --query 'clusterArns' --output table || echo "No ECS clusters"
+        # Check VPCs (excluding default)
+        echo "🌐 VPCs:"
+        aws ec2 describe-vpcs --query 'Vpcs[?!IsDefault && Tags[?Key==`Name` && (contains(Value, `geojson`) || contains(Value, `wordpress`) || contains(Value, `my-vpc`))]].VpcId' --output table || echo "No custom VPCs found"
         
-        echo "=== LAMBDA FUNCTIONS ==="
-        aws lambda list-functions --query 'Functions[*].[FunctionName,Runtime]' --output table || echo "No Lambda functions"
+        # Check S3 buckets
+        echo "📦 S3 Buckets:"
+        aws s3 ls | grep -E "(geojson|wordpress|terraform-state)" || echo "No project-related S3 buckets found"
         
-        echo "=== LOAD BALANCERS ==="
-        aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerName,Type,State.Code]' --output table || echo "No ALBs"
-        aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].[LoadBalancerName,Scheme]' --output table || echo "No Classic ELBs"
+        # Check Lambda functions
+        echo "⚡ Lambda Functions:"
+        aws lambda list-functions --query 'Functions[?contains(FunctionName, `geojson`) || contains(FunctionName, `s3-trigger`)].FunctionName' --output table || echo "No Lambda functions found"
         
-        echo "=== VPCs ==="
-        aws ec2 describe-vpcs --query 'Vpcs[*].[VpcId,IsDefault,State,Tags[?Key==`Name`].Value|[0]]' --output table || echo "No VPCs"
-        
-        echo "=== NAT GATEWAYS ==="
-        aws ec2 describe-nat-gateways --query 'NatGateways[*].[NatGatewayId,State,VpcId]' --output table || echo "No NAT Gateways"
-        
-        echo "=== INTERNET GATEWAYS ==="
-        aws ec2 describe-internet-gateways --query 'InternetGateways[*].[InternetGatewayId,Attachments[0].VpcId,Attachments[0].State]' --output table || echo "No IGWs"
-        
-        echo "=== ELASTIC IPs ==="
-        aws ec2 describe-addresses --query 'Addresses[*].[PublicIp,AllocationId,AssociationId,InstanceId]' --output table || echo "No Elastic IPs"
-        
-        echo "=== SECURITY GROUPS ==="
-        aws ec2 describe-security-groups --query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName,VpcId]' --output table || echo "No custom security groups"
-        
-        echo "=== IAM USER GROUPS ==="
-        aws iam list-groups --query 'Groups[*].[GroupName,CreateDate]' --output table || echo "No IAM groups"
-
-    - name: 1. Terminate ALL EC2 Instances FIRST
-      run: |
-        echo "🧹 STEP 1: TERMINATING ALL EC2 INSTANCES FIRST..."
-        echo "This must be done first to release dependencies on NAT Gateways and Elastic IPs"
-        
-        aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text | tr '\t' '\n' | while read INSTANCE_ID; do
-          if [ ! -z "$INSTANCE_ID" ]; then
-            echo "Terminating instance: $INSTANCE_ID"
-            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
-          fi
-        done
-
-    - name: 2. Wait for instances to terminate
-      run: |
-        echo "⏳ STEP 2: WAITING FOR ALL INSTANCES TO FULLY TERMINATE..."
-        echo "This ensures all dependencies are released before proceeding"
-        
-        # Get list of instances that need to terminate
-        INSTANCE_IDS=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping,shutting-down" --query 'Reservations[*].Instances[*].InstanceId' --output text)
-        
-        if [ ! -z "$INSTANCE_IDS" ]; then
-          echo "Waiting for instances to terminate: $INSTANCE_IDS"
-          echo "This may take several minutes..."
-          aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS || echo "Wait completed or no instances to wait for"
-        else
-          echo "No instances found to wait for"
-        fi
-        
-        echo "✅ All instances terminated!"
-
-    - name: 3. Release ALL Elastic IPs
-      run: |
-        echo "🧹 STEP 3: RELEASING ALL ELASTIC IPs..."
-        echo "Now that instances are terminated, we can safely release Elastic IPs"
-        
-        aws ec2 describe-addresses --query 'Addresses[*].[AllocationId,AssociationId,PublicIp]' --output text | while read ALLOCATION_ID ASSOCIATION_ID PUBLIC_IP; do
-          if [ ! -z "$ALLOCATION_ID" ]; then
-            echo "Processing Elastic IP: $PUBLIC_IP (Allocation: $ALLOCATION_ID)"
-            
-            # Disassociate if still associated (shouldn't be after instance termination)
-            if [ ! -z "$ASSOCIATION_ID" ] && [ "$ASSOCIATION_ID" != "None" ]; then
-              echo "  Disassociating from: $ASSOCIATION_ID"
-              aws ec2 disassociate-address --association-id "$ASSOCIATION_ID" || echo "  Failed to disassociate"
-              sleep 5
-            fi
-            
-            # Release the Elastic IP
-            echo "  Releasing Elastic IP: $PUBLIC_IP"
-            aws ec2 release-address --allocation-id "$ALLOCATION_ID" || echo "  Failed to release $ALLOCATION_ID"
-          fi
-        done
-
-    - name: 4. Delete NAT Gateways
-      run: |
-        echo "🧹 STEP 4: DESTROYING ALL NAT GATEWAYS..."
-        echo "Now that instances and Elastic IPs are cleaned up, we can delete NAT Gateways"
-        
-        aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" --query 'NatGateways[*].NatGatewayId' --output text | tr '\t' '\n' | while read NAT_GW_ID; do
-          if [ ! -z "$NAT_GW_ID" ]; then
-            echo "Deleting NAT Gateway: $NAT_GW_ID"
-            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_GW_ID" || echo "Failed to delete $NAT_GW_ID"
-          fi
-        done
-        
-        # Wait for NAT Gateways to be deleted
-        echo "Waiting for NAT Gateways to be deleted..."
-        sleep 60
-
-    - name: 5. Cleanup Lambda Functions
-      run: |
-        echo "🧹 STEP 5: DESTROYING ALL LAMBDA FUNCTIONS..."
-        aws lambda list-functions --query 'Functions[*].FunctionName' --output text | tr '\t' '\n' | while read FUNC; do
-          if [ ! -z "$FUNC" ]; then
-            echo "Deleting Lambda function: $FUNC"
-            aws lambda delete-function --function-name "$FUNC" || echo "Failed to delete $FUNC"
-          fi
-        done
-
-    - name: 6. Cleanup ECR Repositories
-      run: |
-        echo "🧹 STEP 6: DESTROYING ALL ECR REPOSITORIES..."
-        aws ecr describe-repositories --query 'repositories[*].repositoryName' --output text | tr '\t' '\n' | while read REPO; do
-          if [ ! -z "$REPO" ]; then
-            echo "Deleting ECR repository: $REPO"
-            aws ecr delete-repository --repository-name "$REPO" --force || echo "Failed to delete $REPO"
-          fi
-        done
-
-    - name: 7. Cleanup ECS Resources
-      run: |
-        echo "🧹 STEP 7: DESTROYING ALL ECS RESOURCES..."
-        
-        # Get all clusters
-        aws ecs list-clusters --query 'clusterArns' --output text | tr '\t' '\n' | while read CLUSTER_ARN; do
-          if [ ! -z "$CLUSTER_ARN" ]; then
-            CLUSTER_NAME=$(basename "$CLUSTER_ARN")
-            echo "Processing ECS cluster: $CLUSTER_NAME"
-            
-            # Stop all services in cluster
-            aws ecs list-services --cluster "$CLUSTER_NAME" --query 'serviceArns' --output text | tr '\t' '\n' | while read SERVICE_ARN; do
-              if [ ! -z "$SERVICE_ARN" ]; then
-                SERVICE_NAME=$(basename "$SERVICE_ARN")
-                echo "Stopping service: $SERVICE_NAME"
-                aws ecs update-service --cluster "$CLUSTER_NAME" --service "$SERVICE_NAME" --desired-count 0 || echo "Failed to stop $SERVICE_NAME"
-                sleep 10
-                aws ecs delete-service --cluster "$CLUSTER_NAME" --service "$SERVICE_NAME" || echo "Failed to delete $SERVICE_NAME"
-              fi
-            done
-            
-            # Delete cluster
-            echo "Deleting cluster: $CLUSTER_NAME"
-            aws ecs delete-cluster --cluster "$CLUSTER_NAME" || echo "Failed to delete cluster"
-          fi
-        done
-
-    - name: 8. Cleanup RDS Resources
-      run: |
-        echo "🧹 STEP 8: DESTROYING ALL RDS RESOURCES..."
-        
-        # Delete all DB instances
-        aws rds describe-db-instances --query 'DBInstances[*].DBInstanceIdentifier' --output text | tr '\t' '\n' | while read DB; do
-          if [ ! -z "$DB" ]; then
-            echo "Deleting RDS instance: $DB"
-            aws rds delete-db-instance --db-instance-identifier "$DB" --skip-final-snapshot || echo "Failed to delete $DB"
-          fi
-        done
-        
-        # Wait for DB instances to start deleting
-        sleep 30
-        
-        # Delete parameter groups
-                aws rds describe-db-parameter-groups --query 'DBParameterGroups[?!starts_with(DBParameterGroupName, `default.`)].DBParameterGroupName' --output text | tr '\t' '\n' | while read PG; do
-          if [ ! -z "$PG" ]; then
-            echo "Deleting parameter group: $PG"
-            aws rds delete-db-parameter-group --db-parameter-group-name "$PG" || echo "Failed to delete $PG"
-          fi
-        done
-        
-        # Delete subnet groups
-        aws rds describe-db-subnet-groups --query 'DBSubnetGroups[?!starts_with(DBSubnetGroupName, `default`)].DBSubnetGroupName' --output text | tr '\t' '\n' | while read SG; do
-          if [ ! -z "$SG" ]; then
-            echo "Deleting subnet group: $SG"
-            aws rds delete-db-subnet-group --db-subnet-group-name "$SG" || echo "Failed to delete $SG"
-          fi
-        done
-
-    - name: 9. Cleanup Load Balancers and Target Groups
-      run: |
-        echo "🧹 STEP 9: DESTROYING ALL LOAD BALANCERS AND TARGET GROUPS..."
-        
-        # Delete Application Load Balancers (ALBs) and Network Load Balancers (NLBs)
-        echo "--- Deleting Application/Network Load Balancers ---"
-        aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerArn,LoadBalancerName,Type]' --output text | while read ALB_ARN ALB_NAME ALB_TYPE; do
-          if [ ! -z "$ALB_ARN" ]; then
-            echo "Deleting $ALB_TYPE Load Balancer: $ALB_NAME ($ALB_ARN)"
-            
-            # First, delete all listeners
-            aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query 'Listeners[*].ListenerArn' --output text | tr '\t' '\n' | while read LISTENER_ARN; do
-              if [ ! -z "$LISTENER_ARN" ]; then
-                echo "  Deleting listener: $LISTENER_ARN"
-                aws elbv2 delete-listener --listener-arn "$LISTENER_ARN" || echo "  Failed to delete listener"
-              fi
-            done
-            
-            # Delete the load balancer
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" || echo "Failed to delete ALB: $ALB_NAME"
-            sleep 5
-          fi
-        done
-        
-        # Delete Classic Load Balancers (ELBs)
-        echo "--- Deleting Classic Load Balancers ---"
-        aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text | tr '\t' '\n' | while read ELB_NAME; do
-          if [ ! -z "$ELB_NAME" ]; then
-            echo "Deleting Classic ELB: $ELB_NAME"
-            aws elb delete-load-balancer --load-balancer-name "$ELB_NAME" || echo "Failed to delete ELB: $ELB_NAME"
-            sleep 5
-          fi
-        done
-        
-        # Wait for load balancers to be deleted before proceeding with target groups
-        echo "--- Waiting for load balancers to be deleted ---"
-        sleep 30
-        
-        # Delete Target Groups (after load balancers are deleted)
-        echo "--- Deleting Target Groups ---"
-        aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupArn,TargetGroupName]' --output text | while read TG_ARN TG_NAME; do
-          if [ ! -z "$TG_ARN" ]; then
-            echo "Deleting Target Group: $TG_NAME ($TG_ARN)"
-            aws elbv2 delete-target-group --target-group-arn "$TG_ARN" || echo "Failed to delete Target Group: $TG_NAME"
-            sleep 2
-          fi
-        done
-
-    - name: 10. Cleanup S3 Buckets
-      run: |
-        echo "🧹 STEP 10: DESTROYING ALL S3 BUCKETS..."
-        
-        aws s3 ls | awk '{print $3}' | while read BUCKET; do
-          if [ ! -z "$BUCKET" ]; then
-            echo "Emptying and deleting bucket: $BUCKET"
-            
-            # Remove all versions and delete markers
-            aws s3api list-object-versions --bucket "$BUCKET" --query 'Versions[].{Key:Key,VersionId:VersionId}' --output text | while read KEY VERSION; do
-              if [ ! -z "$KEY" ] && [ ! -z "$VERSION" ]; then
-                aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION" || echo "Failed to delete version"
-              fi
-            done
-            
-            aws s3api list-object-versions --bucket "$BUCKET" --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' --output text | while read KEY VERSION; do
-              if [ ! -z "$KEY" ] && [ ! -z "$VERSION" ]; then
-                aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION" || echo "Failed to delete marker"
-              fi
-            done
-            
-            # Empty bucket and delete
-            aws s3 rm "s3://$BUCKET" --recursive || echo "Failed to empty $BUCKET"
-            aws s3 rb "s3://$BUCKET" || echo "Failed to delete $BUCKET"
-          fi
-        done
-
-    - name: 11. Delete Security Groups
-      run: |
-        echo "🧹 STEP 11: DESTROYING ALL CUSTOM SECURITY GROUPS..."
-        
-        # Get all non-default security groups
-        aws ec2 describe-security-groups --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text | tr '\t' '\n' | while read SG_ID; do
-          if [ ! -z "$SG_ID" ]; then
-            echo "Attempting to delete security group: $SG_ID"
-            
-            # Try multiple times as dependencies may need to clear
-            for i in {1..5}; do
-              if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
-                echo "  Successfully deleted: $SG_ID"
-                break
-              else
-                echo "  Attempt $i failed for $SG_ID, retrying in 30 seconds..."
-                sleep 30
-              fi
-            done
-          fi
-        done
-
-    - name: 12. Detach and Delete Internet Gateways
-      run: |
-        echo "🧹 STEP 12: DESTROYING ALL INTERNET GATEWAYS..."
-        
-        aws ec2 describe-internet-gateways --query 'InternetGateways[*].[InternetGatewayId,Attachments[0].VpcId]' --output text | while read IGW_ID VPC_ID; do
-          if [ ! -z "$IGW_ID" ] && [ "$VPC_ID" != "None" ] && [ ! -z "$VPC_ID" ]; then
-            echo "Detaching IGW $IGW_ID from VPC $VPC_ID"
-            aws ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" || echo "Failed to detach $IGW_ID"
-            sleep 10
-            
-            echo "Deleting IGW: $IGW_ID"
-            aws ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID" || echo "Failed to delete $IGW_ID"
-          fi
-        done
-
-    - name: 13. Delete Subnets
-      run: |
-        echo "🧹 STEP 13: DESTROYING ALL SUBNETS..."
-        
-        aws ec2 describe-subnets --query 'Subnets[*].SubnetId' --output text | tr '\t' '\n' | while read SUBNET_ID; do
-          if [ ! -z "$SUBNET_ID" ]; then
-            echo "Deleting subnet: $SUBNET_ID"
-            aws ec2 delete-subnet --subnet-id "$SUBNET_ID" || echo "Failed to delete $SUBNET_ID"
-          fi
-        done
-
-    - name: 14. Delete Route Tables
-      run: |
-        echo "🧹 STEP 14: DESTROYING ALL CUSTOM ROUTE TABLES..."
-        
-        # Get all route tables that are not main route tables
-        aws ec2 describe-route-tables --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text | tr '\t' '\n' | while read RT_ID; do
-          if [ ! -z "$RT_ID" ]; then
-            echo "Deleting route table: $RT_ID"
-            aws ec2 delete-route-table --route-table-id "$RT_ID" || echo "Failed to delete $RT_ID"
-          fi
-        done
-
-    - name: 15. Delete VPCs
-      run: |
-        echo "🧹 STEP 15: DESTROYING ALL NON-DEFAULT VPCs..."
-        
-        aws ec2 describe-vpcs --query 'Vpcs[?IsDefault!=`true`].VpcId' --output text | tr '\t' '\n' | while read VPC_ID; do
-          if [ ! -z "$VPC_ID" ]; then
-            echo "Deleting VPC: $VPC_ID"
-            aws ec2 delete-vpc --vpc-id "$VPC_ID" || echo "Failed to delete $VPC_ID"
-          fi
-        done
-
-    - name: 16. Cleanup CloudWatch Log Groups
-      run: |
-        echo "🧹 STEP 16: DESTROYING ALL CLOUDWATCH LOG GROUPS..."
-        
-        aws logs describe-log-groups --query 'logGroups[*].logGroupName' --output text | tr '\t' '\n' | while read LOG_GROUP; do
-          if [ ! -z "$LOG_GROUP" ]; then
-            echo "Deleting log group: $LOG_GROUP"
-            aws logs delete-log-group --log-group-name "$LOG_GROUP" || echo "Failed to delete $LOG_GROUP"
-          fi
-        done
-
-    - name: 17. Cleanup IAM User Groups
-      run: |
-        echo "🧹 STEP 17: DESTROYING ALL IAM USER GROUPS..."
-        
-        # Get all IAM groups
-        aws iam list-groups --query 'Groups[*].GroupName' --output text | tr '\t' '\n' | while read GROUP_NAME; do
-          if [ ! -z "$GROUP_NAME" ]; then
-            echo "Processing IAM group: $GROUP_NAME"
-            
-            # Remove all users from the group
-            aws iam get-group --group-name "$GROUP_NAME" --query 'Users[*].UserName' --output text | tr '\t' '\n' | while read USER_NAME; do
-              if [ ! -z "$USER_NAME" ]; then
-                echo "  Removing user $USER_NAME from group $GROUP_NAME"
-                aws iam remove-user-from-group --group-name "$GROUP_NAME" --user-name "$USER_NAME" || echo "  Failed to remove user $USER_NAME"
-              fi
-            done
-            
-            # Detach all managed policies from the group
-                        aws iam list-attached-group-policies --group-name "$GROUP_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read POLICY_ARN; do
-              if [ ! -z "$POLICY_ARN" ]; then
-                echo "  Detaching managed policy $POLICY_ARN from group $GROUP_NAME"
-                aws iam detach-group-policy --group-name "$GROUP_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach policy $POLICY_ARN"
-              fi
-            done
-            
-            # Delete all inline policies from the group
-            aws iam list-group-policies --group-name "$GROUP_NAME" --query 'PolicyNames' --output text | tr '\t' '\n' | while read POLICY_NAME; do
-              if [ ! -z "$POLICY_NAME" ]; then
-                echo "  Deleting inline policy $POLICY_NAME from group $GROUP_NAME"
-                aws iam delete-group-policy --group-name "$GROUP_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete inline policy $POLICY_NAME"
-              fi
-            done
-            
-            # Delete the group
-            echo "  Deleting IAM group: $GROUP_NAME"
-            aws iam delete-group --group-name "$GROUP_NAME" || echo "  Failed to delete group $GROUP_NAME"
-          fi
-        done
-
-    - name: 18. Cleanup IAM Roles
-      run: |
-        echo "🧹 STEP 18: DESTROYING ALL CUSTOM IAM ROLES..."
-        
-        # Get all IAM roles (excluding AWS service roles)
-        aws iam list-roles --query 'Roles[?!starts_with(RoleName, `AWS`) && !starts_with(RoleName, `aws-`) && !starts_with(RoleName, `service-role`)].RoleName' --output text | tr '\t' '\n' | while read ROLE_NAME; do
-          if [ ! -z "$ROLE_NAME" ]; then
-            echo "Processing IAM role: $ROLE_NAME"
-            
-            # Detach all managed policies from the role
-            aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read POLICY_ARN; do
-              if [ ! -z "$POLICY_ARN" ]; then
-                echo "  Detaching managed policy $POLICY_ARN from role $ROLE_NAME"
-                aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach policy $POLICY_ARN"
-              fi
-            done
-            
-            # Delete all inline policies from the role
-            aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text | tr '\t' '\n' | while read POLICY_NAME; do
-              if [ ! -z "$POLICY_NAME" ]; then
-                echo "  Deleting inline policy $POLICY_NAME from role $ROLE_NAME"
-                aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete inline policy $POLICY_NAME"
-              fi
-            done
-            
-            # Remove role from instance profiles
-            aws iam list-instance-profiles-for-role --role-name "$ROLE_NAME" --query 'InstanceProfiles[*].InstanceProfileName' --output text | tr '\t' '\n' | while read PROFILE_NAME; do
-              if [ ! -z "$PROFILE_NAME" ]; then
-                echo "  Removing role $ROLE_NAME from instance profile $PROFILE_NAME"
-                aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME" || echo "  Failed to remove role from profile"
-              fi
-            done
-            
-            # Delete the role
-            echo "  Deleting IAM role: $ROLE_NAME"
-            aws iam delete-role --role-name "$ROLE_NAME" || echo "  Failed to delete role $ROLE_NAME"
-          fi
-        done
-
-    - name: 19. Cleanup IAM Policies
-      run: |
-        echo "🧹 STEP 19: DESTROYING ALL CUSTOM IAM POLICIES..."
-        
-        # Get all customer managed policies (not AWS managed)
-        aws iam list-policies --scope Local --query 'Policies[*].[PolicyName,Arn]' --output text | while read POLICY_NAME POLICY_ARN; do
-          if [ ! -z "$POLICY_ARN" ]; then
-            echo "Processing custom IAM policy: $POLICY_NAME ($POLICY_ARN)"
-            
-            # Get all policy versions
-            aws iam list-policy-versions --policy-arn "$POLICY_ARN" --query 'Versions[?!IsDefaultVersion].VersionId' --output text | tr '\t' '\n' | while read VERSION_ID; do
-              if [ ! -z "$VERSION_ID" ]; then
-                echo "  Deleting policy version: $VERSION_ID"
-                aws iam delete-policy-version --policy-arn "$POLICY_ARN" --version-id "$VERSION_ID" || echo "  Failed to delete version $VERSION_ID"
-              fi
-            done
-            
-            # Delete the policy
-            echo "  Deleting IAM policy: $POLICY_NAME"
-            aws iam delete-policy --policy-arn "$POLICY_ARN" || echo "  Failed to delete policy $POLICY_NAME"
-          fi
-        done
-
-    - name: 20. Cleanup IAM Instance Profiles
-      run: |
-        echo "🧹 STEP 20: DESTROYING ALL IAM INSTANCE PROFILES..."
-        
-        aws iam list-instance-profiles --query 'InstanceProfiles[*].InstanceProfileName' --output text | tr '\t' '\n' | while read PROFILE_NAME; do
-          if [ ! -z "$PROFILE_NAME" ]; then
-            echo "Deleting instance profile: $PROFILE_NAME"
-            aws iam delete-instance-profile --instance-profile-name "$PROFILE_NAME" || echo "Failed to delete instance profile $PROFILE_NAME"
-          fi
-        done
-
-    - name: 21. Cleanup DynamoDB Tables
-      run: |
-        echo "🧹 STEP 21: DESTROYING ALL DYNAMODB TABLES..."
-        
-        aws dynamodb list-tables --query 'TableNames' --output text | tr '\t' '\n' | while read TABLE_NAME; do
-          if [ ! -z "$TABLE_NAME" ]; then
-            echo "Deleting DynamoDB table: $TABLE_NAME"
-            aws dynamodb delete-table --table-name "$TABLE_NAME" || echo "Failed to delete table $TABLE_NAME"
-          fi
-        done
-
-    - name: 22. Cleanup API Gateway APIs
-      run: |
-        echo "🧹 STEP 22: DESTROYING ALL API GATEWAY APIs..."
-        
-        # REST APIs
-        aws apigateway get-rest-apis --query 'items[*].[id,name]' --output text | while read API_ID API_NAME; do
-          if [ ! -z "$API_ID" ]; then
-            echo "Deleting REST API: $API_NAME ($API_ID)"
-            aws apigateway delete-rest-api --rest-api-id "$API_ID" || echo "Failed to delete REST API $API_ID"
-          fi
-        done
-        
-        # HTTP APIs (API Gateway v2)
-        aws apigatewayv2 get-apis --query 'Items[*].[ApiId,Name]' --output text | while read API_ID API_NAME; do
-          if [ ! -z "$API_ID" ]; then
-            echo "Deleting HTTP API: $API_NAME ($API_ID)"
-            aws apigatewayv2 delete-api --api-id "$API_ID" || echo "Failed to delete HTTP API $API_ID"
-          fi
-        done
-
-    - name: 23. Final Verification
-      run: |
-        echo "🔍 FINAL VERIFICATION - SCANNING FOR REMAINING RESOURCES..."
-        echo "============================================================"
-        
-        echo "=== REMAINING EC2 INSTANCES ==="
-        INSTANCES=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text)
-        if [ -z "$INSTANCES" ]; then
-          echo "✅ No EC2 instances remaining"
-        else
-          echo "⚠️ Remaining instances: $INSTANCES"
-        fi
-        
-        echo "=== REMAINING RDS INSTANCES ==="
-        RDS_INSTANCES=$(aws rds describe-db-instances --query 'DBInstances[*].DBInstanceIdentifier' --output text)
-        if [ -z "$RDS_INSTANCES" ]; then
-          echo "✅ No RDS instances remaining"
-        else
-          echo "⚠️ Remaining RDS instances: $RDS_INSTANCES"
-        fi
-        
-        echo "=== REMAINING S3 BUCKETS ==="
-        BUCKETS=$(aws s3 ls | awk '{print $3}' | tr '\n' ' ')
-        if [ -z "$BUCKETS" ]; then
-          echo "✅ No S3 buckets remaining"
-        else
-          echo "⚠️ Remaining buckets: $BUCKETS"
-        fi
-        
-        echo "=== REMAINING ECR REPOSITORIES ==="
-        ECR_REPOS=$(aws ecr describe-repositories --query 'repositories[*].repositoryName' --output text)
-        if [ -z "$ECR_REPOS" ]; then
-          echo "✅ No ECR repositories remaining"
-        else
-          echo "⚠️ Remaining ECR repos: $ECR_REPOS"
-        fi
-        
-        echo "=== REMAINING ECS CLUSTERS ==="
-        ECS_CLUSTERS=$(aws ecs list-clusters --query 'clusterArns' --output text)
-        if [ -z "$ECS_CLUSTERS" ]; then
-          echo "✅ No ECS clusters remaining"
-        else
-          echo "⚠️ Remaining ECS clusters: $ECS_CLUSTERS"
-        fi
-        
-        echo "=== REMAINING LAMBDA FUNCTIONS ==="
-        LAMBDA_FUNCS=$(aws lambda list-functions --query 'Functions[*].FunctionName' --output text)
-        if [ -z "$LAMBDA_FUNCS" ]; then
-          echo "✅ No Lambda functions remaining"
-        else
-          echo "⚠️ Remaining Lambda functions: $LAMBDA_FUNCS"
-        fi
+        # Check IAM roles
+        echo "👥 IAM Roles:"
+        aws iam list-roles --query 'Roles[?contains(RoleName, `geojson`) || contains(RoleName, `wordpress`) || contains(RoleName, `ecs`)].RoleName' --output table || echo "No project-related IAM roles found"
         
         echo ""
-        echo "🎯 NUCLEAR CLEANUP COMPLETED!"
-        echo "============================================"
-        echo "All AWS resources have been processed for deletion."
-        echo "Some resources may take additional time to fully terminate."
-        echo "Please check the AWS Console to verify complete cleanup."
+        echo "✅ Final verification completed"
+        echo ""
+        echo "📋 DESTRUCTION SUMMARY:"
+        echo "======================"
+        echo "• Application infrastructure: ${{ needs.destroy-application.result }}"
+        if [ "${{ github.event.inputs.destroy_state_infrastructure }}" = "true" ]; then
+          echo "• State infrastructure: ${{ needs.destroy-state-infrastructure.result }}"
+        else
+          echo "• State infrastructure: PRESERVED (as requested)"
+        fi
+        echo ""
+        echo "🎉 Infrastructure destruction workflow completed!"
+        
+    - name: Post-Destruction Notice
+      run: |
+        echo "📢 POST-DESTRUCTION NOTICE"
+        echo "========================="
+        echo ""
+        echo "✅ Infrastructure destruction completed successfully!"
+        echo ""
+        echo "📋 What was destroyed:"
+        echo "  • All application infrastructure (ECS, RDS, VPC, etc.)"
+        echo "  • All Docker images in ECR"
+        echo "  • All application data"
+        if [ "${{ github.event.inputs.destroy_state_infrastructure }}" = "true" ]; then
+          echo "  • Terraform state infrastructure"
+          echo "  • All Terraform state history"
+          echo ""
+          echo "⚠️  IMPORTANT: State infrastructure was destroyed!"
+          echo "   To deploy again, you'll need to:"
+          echo "   1. Remove or rename backend.tf"
+          echo "   2. Run terraform init with local state"
+          echo "   3. Recreate state infrastructure first"
+        else
+          echo ""
+          echo "ℹ️  State infrastructure was preserved"
+          echo "   You can redeploy by running the CI/CD pipeline again"
+        fi
+        echo ""
+        echo "🔍 If you see any remaining resources above, you may need to:"
+        echo "  • Delete them manually in the AWS console"
+        echo "  • Check for resources in other regions"
+        echo "  • Verify IAM permissions for cleanup"
+        echo ""
+        echo "💰 Remember to check your AWS billing to ensure no unexpected charges"
