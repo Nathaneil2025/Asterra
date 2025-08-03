@@ -1,0 +1,171 @@
+name: 🗑️ Destroy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm infrastructure destruction'
+        required: true
+        type: string
+      destroy_state_bucket:
+        description: 'Also destroy the Terraform state bucket (DANGEROUS!)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Validate Confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+          echo "❌ You must type 'DESTROY' exactly to confirm"
+          echo "   You typed: '${{ github.event.inputs.confirm_destroy }}'"
+          exit 1
+        fi
+        echo "✅ Destroy confirmation validated"
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.12.2
+        terraform_wrapper: false
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Verify AWS Access
+      run: |
+        echo "🔐 Verifying AWS access..."
+        aws sts get-caller-identity
+        echo "✅ AWS access confirmed"
+
+    - name: Prepare Terraform
+      run: |
+        echo "🔧 Preparing Terraform..."
+        
+        # Disable state-setup.tf to avoid conflicts during destroy
+        if [ -f "state-setup.tf" ]; then
+          mv state-setup.tf state-setup.tf.disabled
+          echo "✅ Disabled state-setup.tf"
+        fi
+        
+        # Ensure backend.tf is enabled to use remote state
+        if [ -f "backend.tf.disabled" ]; then
+          mv backend.tf.disabled backend.tf
+          echo "✅ Enabled backend.tf"
+        fi
+
+    - name: Initialize Terraform
+      run: |
+        echo "🔧 Initializing Terraform with remote state..."
+        terraform init -input=false
+        echo "✅ Terraform initialized"
+
+    - name: Show Current Resources
+      run: |
+        echo "📋 Resources currently managed by Terraform:"
+        echo "============================================="
+        terraform state list || echo "No resources found in state"
+        echo ""
+        echo "📊 Total resources: $(terraform state list | wc -l)"
+
+    - name: Create Destroy Plan
+      run: |
+        echo "📋 Creating destroy plan..."
+        terraform plan -destroy -out=destroy.tfplan -input=false
+        echo "✅ Destroy plan created"
+
+    - name: Show Destroy Plan
+      run: |
+        echo "📊 DESTROY PLAN:"
+        echo "==============="
+        terraform show destroy.tfplan
+
+    - name: Apply Destroy
+      run: |
+        echo "🗑️ DESTROYING INFRASTRUCTURE..."
+        echo "==============================="
+        echo ""
+        echo "⚠️  This will permanently delete all resources!"
+        echo ""
+        
+        # Apply the destroy plan
+        terraform apply destroy.tfplan
+        
+        echo ""
+        echo "✅ Infrastructure destruction completed"
+
+    - name: Verify Destruction
+      run: |
+        echo "🔍 Verifying destruction..."
+        
+        REMAINING=$(terraform state list | wc -l)
+        echo "Remaining resources in state: $REMAINING"
+        
+        if [ "$REMAINING" -eq 0 ]; then
+          echo "✅ All resources successfully destroyed"
+        else
+          echo "⚠️ Some resources remain:"
+          terraform state list
+        fi
+
+    - name: Destroy State Bucket (Optional)
+      if: github.event.inputs.destroy_state_bucket == 'true'
+      run: |
+        echo "🚨 DESTROYING STATE BUCKET..."
+        echo "============================="
+        echo ""
+        echo "⚠️  This will delete ALL Terraform state history!"
+        echo ""
+        
+        # Download state as backup
+        aws s3 cp s3://terraform-state-asterra-project/geojson-processor/terraform.tfstate ./state-backup.tfstate || echo "No state file to backup"
+        
+        # Empty and delete the bucket
+        aws s3 rm s3://terraform-state-asterra-project --recursive || echo "Bucket already empty"
+        aws s3 rb s3://terraform-state-asterra-project || echo "Bucket doesn't exist"
+        
+        # Delete DynamoDB table
+        aws dynamodb delete-table --table-name terraform-state-lock --region ${{ env.AWS_REGION }} || echo "DynamoDB table doesn't exist"
+        
+        echo "✅ State infrastructure destroyed"
+
+    - name: Final Summary
+      run: |
+        echo "🎉 DESTRUCTION COMPLETE!"
+        echo "======================="
+        echo ""
+        echo "✅ All application infrastructure destroyed"
+        if [ "${{ github.event.inputs.destroy_state_bucket }}" = "true" ]; then
+          echo "✅ State bucket and DynamoDB table destroyed"
+          echo "⚠️  You'll need to recreate state infrastructure to deploy again"
+        else
+          echo "ℹ️  State bucket preserved - you can redeploy anytime"
+        fi
+        echo ""
+        echo "💰 Check your AWS billing to ensure no unexpected charges"
+
+    - name: Upload Logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: destroy-logs
+        path: |
+          *.tfplan
+          *.tfstate
+          state-backup.tfstate
+        retention-days: 30
