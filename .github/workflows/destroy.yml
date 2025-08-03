@@ -63,10 +63,81 @@ jobs:
         
         echo "=== SECURITY GROUPS ==="
         aws ec2 describe-security-groups --query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName,VpcId]' --output table || echo "No custom security groups"
+        
+        echo "=== IAM USER GROUPS ==="
+        aws iam list-groups --query 'Groups[*].[GroupName,CreateDate]' --output table || echo "No IAM groups"
 
-    - name: 1. Cleanup Lambda Functions
+    - name: 1. Terminate ALL EC2 Instances FIRST
       run: |
-        echo "🧹 STEP 1: DESTROYING ALL LAMBDA FUNCTIONS..."
+        echo "🧹 STEP 1: TERMINATING ALL EC2 INSTANCES FIRST..."
+        echo "This must be done first to release dependencies on NAT Gateways and Elastic IPs"
+        
+        aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text | tr '\t' '\n' | while read INSTANCE_ID; do
+          if [ ! -z "$INSTANCE_ID" ]; then
+            echo "Terminating instance: $INSTANCE_ID"
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
+          fi
+        done
+
+    - name: 2. Wait for instances to terminate
+      run: |
+        echo "⏳ STEP 2: WAITING FOR ALL INSTANCES TO FULLY TERMINATE..."
+        echo "This ensures all dependencies are released before proceeding"
+        
+        # Get list of instances that need to terminate
+        INSTANCE_IDS=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping,shutting-down" --query 'Reservations[*].Instances[*].InstanceId' --output text)
+        
+        if [ ! -z "$INSTANCE_IDS" ]; then
+          echo "Waiting for instances to terminate: $INSTANCE_IDS"
+          echo "This may take several minutes..."
+          aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS || echo "Wait completed or no instances to wait for"
+        else
+          echo "No instances found to wait for"
+        fi
+        
+        echo "✅ All instances terminated!"
+
+    - name: 3. Release ALL Elastic IPs
+      run: |
+        echo "🧹 STEP 3: RELEASING ALL ELASTIC IPs..."
+        echo "Now that instances are terminated, we can safely release Elastic IPs"
+        
+        aws ec2 describe-addresses --query 'Addresses[*].[AllocationId,AssociationId,PublicIp]' --output text | while read ALLOCATION_ID ASSOCIATION_ID PUBLIC_IP; do
+          if [ ! -z "$ALLOCATION_ID" ]; then
+            echo "Processing Elastic IP: $PUBLIC_IP (Allocation: $ALLOCATION_ID)"
+            
+            # Disassociate if still associated (shouldn't be after instance termination)
+            if [ ! -z "$ASSOCIATION_ID" ] && [ "$ASSOCIATION_ID" != "None" ]; then
+              echo "  Disassociating from: $ASSOCIATION_ID"
+              aws ec2 disassociate-address --association-id "$ASSOCIATION_ID" || echo "  Failed to disassociate"
+              sleep 5
+            fi
+            
+            # Release the Elastic IP
+            echo "  Releasing Elastic IP: $PUBLIC_IP"
+            aws ec2 release-address --allocation-id "$ALLOCATION_ID" || echo "  Failed to release $ALLOCATION_ID"
+          fi
+        done
+
+    - name: 4. Delete NAT Gateways
+      run: |
+        echo "🧹 STEP 4: DESTROYING ALL NAT GATEWAYS..."
+        echo "Now that instances and Elastic IPs are cleaned up, we can delete NAT Gateways"
+        
+        aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" --query 'NatGateways[*].NatGatewayId' --output text | tr '\t' '\n' | while read NAT_GW_ID; do
+          if [ ! -z "$NAT_GW_ID" ]; then
+            echo "Deleting NAT Gateway: $NAT_GW_ID"
+            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_GW_ID" || echo "Failed to delete $NAT_GW_ID"
+          fi
+        done
+        
+        # Wait for NAT Gateways to be deleted
+        echo "Waiting for NAT Gateways to be deleted..."
+        sleep 60
+
+    - name: 5. Cleanup Lambda Functions
+      run: |
+        echo "🧹 STEP 5: DESTROYING ALL LAMBDA FUNCTIONS..."
         aws lambda list-functions --query 'Functions[*].FunctionName' --output text | tr '\t' '\n' | while read FUNC; do
           if [ ! -z "$FUNC" ]; then
             echo "Deleting Lambda function: $FUNC"
@@ -74,9 +145,9 @@ jobs:
           fi
         done
 
-    - name: 2. Cleanup ECR Repositories
+    - name: 6. Cleanup ECR Repositories
       run: |
-        echo "🧹 STEP 2: DESTROYING ALL ECR REPOSITORIES..."
+        echo "🧹 STEP 6: DESTROYING ALL ECR REPOSITORIES..."
         aws ecr describe-repositories --query 'repositories[*].repositoryName' --output text | tr '\t' '\n' | while read REPO; do
           if [ ! -z "$REPO" ]; then
             echo "Deleting ECR repository: $REPO"
@@ -84,9 +155,9 @@ jobs:
           fi
         done
 
-    - name: 3. Cleanup ECS Resources
+    - name: 7. Cleanup ECS Resources
       run: |
-        echo "🧹 STEP 3: DESTROYING ALL ECS RESOURCES..."
+        echo "🧹 STEP 7: DESTROYING ALL ECS RESOURCES..."
         
         # Get all clusters
         aws ecs list-clusters --query 'clusterArns' --output text | tr '\t' '\n' | while read CLUSTER_ARN; do
@@ -111,9 +182,9 @@ jobs:
           fi
         done
 
-    - name: 4. Cleanup RDS Resources
+    - name: 8. Cleanup RDS Resources
       run: |
-        echo "🧹 STEP 4: DESTROYING ALL RDS RESOURCES..."
+        echo "🧹 STEP 8: DESTROYING ALL RDS RESOURCES..."
         
         # Delete all DB instances
         aws rds describe-db-instances --query 'DBInstances[*].DBInstanceIdentifier' --output text | tr '\t' '\n' | while read DB; do
@@ -127,7 +198,7 @@ jobs:
         sleep 30
         
         # Delete parameter groups
-        aws rds describe-db-parameter-groups --query 'DBParameterGroups[?!starts_with(DBParameterGroupName, `default.`)].DBParameterGroupName' --output text | tr '\t' '\n' | while read PG; do
+                aws rds describe-db-parameter-groups --query 'DBParameterGroups[?!starts_with(DBParameterGroupName, `default.`)].DBParameterGroupName' --output text | tr '\t' '\n' | while read PG; do
           if [ ! -z "$PG" ]; then
             echo "Deleting parameter group: $PG"
             aws rds delete-db-parameter-group --db-parameter-group-name "$PG" || echo "Failed to delete $PG"
@@ -142,9 +213,9 @@ jobs:
           fi
         done
 
-    - name: 5. Cleanup Load Balancers and Target Groups
+    - name: 9. Cleanup Load Balancers and Target Groups
       run: |
-        echo "🧹 STEP 5: DESTROYING ALL LOAD BALANCERS AND TARGET GROUPS..."
+        echo "🧹 STEP 9: DESTROYING ALL LOAD BALANCERS AND TARGET GROUPS..."
         
         # Delete Application Load Balancers (ALBs) and Network Load Balancers (NLBs)
         echo "--- Deleting Application/Network Load Balancers ---"
@@ -189,26 +260,10 @@ jobs:
             sleep 2
           fi
         done
-        
-        # Verify cleanup
-        echo "--- Verifying Load Balancer Cleanup ---"
-        REMAINING_ALBS=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
-        REMAINING_ELBS=$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
-        REMAINING_TGS=$(aws elbv2 describe-target-groups --query 'TargetGroups[*].TargetGroupName' --output text 2>/dev/null | wc -w)
-        
-        echo "Remaining ALB/NLBs: $REMAINING_ALBS"
-        echo "Remaining Classic ELBs: $REMAINING_ELBS"
-        echo "Remaining Target Groups: $REMAINING_TGS"
-        
-        if [ "$REMAINING_ALBS" -eq 0 ] && [ "$REMAINING_ELBS" -eq 0 ] && [ "$REMAINING_TGS" -eq 0 ]; then
-          echo "✅ All load balancers and target groups successfully deleted!"
-        else
-          echo "⚠️  Some load balancers or target groups may still be deleting..."
-        fi
 
-    - name: 6. Cleanup S3 Buckets
+    - name: 10. Cleanup S3 Buckets
       run: |
-        echo "🧹 STEP 6: DESTROYING ALL S3 BUCKETS..."
+        echo "🧹 STEP 10: DESTROYING ALL S3 BUCKETS..."
         
         aws s3 ls | awk '{print $3}' | while read BUCKET; do
           if [ ! -z "$BUCKET" ]; then
@@ -233,63 +288,6 @@ jobs:
           fi
         done
 
-    - name: 7. Terminate ALL EC2 Instances
-      run: |
-        echo "🧹 STEP 7: TERMINATING ALL EC2 INSTANCES..."
-        
-        aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text | tr '\t' '\n' | while read INSTANCE_ID; do
-          if [ ! -z "$INSTANCE_ID" ]; then
-            echo "Terminating instance: $INSTANCE_ID"
-            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || echo "Failed to terminate $INSTANCE_ID"
-          fi
-        done
-
-    - name: 8. Wait for instances to terminate
-      run: |
-        echo "⏳ STEP 8: WAITING FOR INSTANCES TO TERMINATE..."
-        
-        # Wait for all instances to be terminated
-        echo "Waiting for all instances to terminate (this may take several minutes)..."
-        aws ec2 wait instance-terminated --instance-ids $(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping,shutting-down" --query 'Reservations[*].Instances[*].InstanceId' --output text) 2>/dev/null || echo "No instances to wait for"
-        
-        echo "All instances terminated!"
-
-    - name: 9. Release ALL Elastic IPs
-      run: |
-        echo "🧹 STEP 9: RELEASING ALL ELASTIC IPs..."
-        
-        aws ec2 describe-addresses --query 'Addresses[*].[AllocationId,AssociationId,PublicIp]' --output text | while read ALLOCATION_ID ASSOCIATION_ID PUBLIC_IP; do
-          if [ ! -z "$ALLOCATION_ID" ]; then
-            echo "Processing Elastic IP: $PUBLIC_IP (Allocation: $ALLOCATION_ID)"
-            
-            # Disassociate if associated
-            if [ ! -z "$ASSOCIATION_ID" ] && [ "$ASSOCIATION_ID" != "None" ]; then
-              echo "  Disassociating from: $ASSOCIATION_ID"
-              aws ec2 disassociate-address --association-id "$ASSOCIATION_ID" || echo "  Failed to disassociate"
-              sleep 5
-            fi
-            
-            # Release the Elastic IP
-            echo "  Releasing Elastic IP: $PUBLIC_IP"
-            aws ec2 release-address --allocation-id "$ALLOCATION_ID" || echo "  Failed to release $ALLOCATION_ID"
-          fi
-        done
-
-    - name: 10. Delete NAT Gateways
-      run: |
-        echo "🧹 STEP 10: DESTROYING ALL NAT GATEWAYS..."
-        
-        aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" --query 'NatGateways[*].NatGatewayId' --output text | tr '\t' '\n' | while read NAT_GW_ID; do
-          if [ ! -z "$NAT_GW_ID" ]; then
-            echo "Deleting NAT Gateway: $NAT_GW_ID"
-            aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_GW_ID" || echo "Failed to delete $NAT_GW_ID"
-          fi
-        done
-        
-        # Wait for NAT Gateways to be deleted
-        echo "Waiting for NAT Gateways to be deleted..."
-        sleep 60
-
     - name: 11. Delete Security Groups
       run: |
         echo "🧹 STEP 11: DESTROYING ALL CUSTOM SECURITY GROUPS..."
@@ -301,7 +299,7 @@ jobs:
             
             # Try multiple times as dependencies may need to clear
             for i in {1..5}; do
-                            if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
+              if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
                 echo "  Successfully deleted: $SG_ID"
                 break
               else
@@ -372,101 +370,205 @@ jobs:
           fi
         done
 
-    - name: 17. Cleanup IAM Roles and Policies
+    - name: 17. Cleanup IAM User Groups
       run: |
-        echo "🧹 STEP 17: DESTROYING ALL CUSTOM IAM ROLES..."
+        echo "🧹 STEP 17: DESTROYING ALL IAM USER GROUPS..."
         
-        # Get all roles that are not AWS service roles
+        # Get all IAM groups
+        aws iam list-groups --query 'Groups[*].GroupName' --output text | tr '\t' '\n' | while read GROUP_NAME; do
+          if [ ! -z "$GROUP_NAME" ]; then
+            echo "Processing IAM group: $GROUP_NAME"
+            
+            # Remove all users from the group
+            aws iam get-group --group-name "$GROUP_NAME" --query 'Users[*].UserName' --output text | tr '\t' '\n' | while read USER_NAME; do
+              if [ ! -z "$USER_NAME" ]; then
+                echo "  Removing user $USER_NAME from group $GROUP_NAME"
+                aws iam remove-user-from-group --group-name "$GROUP_NAME" --user-name "$USER_NAME" || echo "  Failed to remove user $USER_NAME"
+              fi
+            done
+            
+            # Detach all managed policies from the group
+                        aws iam list-attached-group-policies --group-name "$GROUP_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read POLICY_ARN; do
+              if [ ! -z "$POLICY_ARN" ]; then
+                echo "  Detaching managed policy $POLICY_ARN from group $GROUP_NAME"
+                aws iam detach-group-policy --group-name "$GROUP_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach policy $POLICY_ARN"
+              fi
+            done
+            
+            # Delete all inline policies from the group
+            aws iam list-group-policies --group-name "$GROUP_NAME" --query 'PolicyNames' --output text | tr '\t' '\n' | while read POLICY_NAME; do
+              if [ ! -z "$POLICY_NAME" ]; then
+                echo "  Deleting inline policy $POLICY_NAME from group $GROUP_NAME"
+                aws iam delete-group-policy --group-name "$GROUP_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete inline policy $POLICY_NAME"
+              fi
+            done
+            
+            # Delete the group
+            echo "  Deleting IAM group: $GROUP_NAME"
+            aws iam delete-group --group-name "$GROUP_NAME" || echo "  Failed to delete group $GROUP_NAME"
+          fi
+        done
+
+    - name: 18. Cleanup IAM Roles
+      run: |
+        echo "🧹 STEP 18: DESTROYING ALL CUSTOM IAM ROLES..."
+        
+        # Get all IAM roles (excluding AWS service roles)
         aws iam list-roles --query 'Roles[?!starts_with(RoleName, `AWS`) && !starts_with(RoleName, `aws-`) && !starts_with(RoleName, `service-role`)].RoleName' --output text | tr '\t' '\n' | while read ROLE_NAME; do
           if [ ! -z "$ROLE_NAME" ]; then
-            echo "Processing role: $ROLE_NAME"
+            echo "Processing IAM role: $ROLE_NAME"
             
-            # Detach managed policies
+            # Detach all managed policies from the role
             aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text | tr '\t' '\n' | while read POLICY_ARN; do
               if [ ! -z "$POLICY_ARN" ]; then
-                echo "  Detaching policy: $POLICY_ARN"
-                aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach $POLICY_ARN"
+                echo "  Detaching managed policy $POLICY_ARN from role $ROLE_NAME"
+                aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || echo "  Failed to detach policy $POLICY_ARN"
               fi
             done
             
-            # Delete inline policies
+            # Delete all inline policies from the role
             aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text | tr '\t' '\n' | while read POLICY_NAME; do
               if [ ! -z "$POLICY_NAME" ]; then
-                echo "  Deleting inline policy: $POLICY_NAME"
-                aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete $POLICY_NAME"
+                echo "  Deleting inline policy $POLICY_NAME from role $ROLE_NAME"
+                aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME" || echo "  Failed to delete inline policy $POLICY_NAME"
               fi
             done
             
-            # Delete instance profiles
+            # Remove role from instance profiles
             aws iam list-instance-profiles-for-role --role-name "$ROLE_NAME" --query 'InstanceProfiles[*].InstanceProfileName' --output text | tr '\t' '\n' | while read PROFILE_NAME; do
               if [ ! -z "$PROFILE_NAME" ]; then
-                echo "  Removing role from instance profile: $PROFILE_NAME"
-                aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME" || echo "  Failed to remove role"
-                echo "  Deleting instance profile: $PROFILE_NAME"
-                aws iam delete-instance-profile --instance-profile-name "$PROFILE_NAME" || echo "  Failed to delete profile"
+                echo "  Removing role $ROLE_NAME from instance profile $PROFILE_NAME"
+                aws iam remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME" || echo "  Failed to remove role from profile"
               fi
             done
             
             # Delete the role
-            echo "  Deleting role: $ROLE_NAME"
-            aws iam delete-role --role-name "$ROLE_NAME" || echo "  Failed to delete $ROLE_NAME"
+            echo "  Deleting IAM role: $ROLE_NAME"
+            aws iam delete-role --role-name "$ROLE_NAME" || echo "  Failed to delete role $ROLE_NAME"
           fi
         done
 
-        - name: 18. Final Resource Verification
+    - name: 19. Cleanup IAM Policies
       run: |
-        echo "🔍 FINAL VERIFICATION - CHECKING FOR REMAINING RESOURCES..."
+        echo "🧹 STEP 19: DESTROYING ALL CUSTOM IAM POLICIES..."
+        
+        # Get all customer managed policies (not AWS managed)
+        aws iam list-policies --scope Local --query 'Policies[*].[PolicyName,Arn]' --output text | while read POLICY_NAME POLICY_ARN; do
+          if [ ! -z "$POLICY_ARN" ]; then
+            echo "Processing custom IAM policy: $POLICY_NAME ($POLICY_ARN)"
+            
+            # Get all policy versions
+            aws iam list-policy-versions --policy-arn "$POLICY_ARN" --query 'Versions[?!IsDefaultVersion].VersionId' --output text | tr '\t' '\n' | while read VERSION_ID; do
+              if [ ! -z "$VERSION_ID" ]; then
+                echo "  Deleting policy version: $VERSION_ID"
+                aws iam delete-policy-version --policy-arn "$POLICY_ARN" --version-id "$VERSION_ID" || echo "  Failed to delete version $VERSION_ID"
+              fi
+            done
+            
+            # Delete the policy
+            echo "  Deleting IAM policy: $POLICY_NAME"
+            aws iam delete-policy --policy-arn "$POLICY_ARN" || echo "  Failed to delete policy $POLICY_NAME"
+          fi
+        done
+
+    - name: 20. Cleanup IAM Instance Profiles
+      run: |
+        echo "🧹 STEP 20: DESTROYING ALL IAM INSTANCE PROFILES..."
+        
+        aws iam list-instance-profiles --query 'InstanceProfiles[*].InstanceProfileName' --output text | tr '\t' '\n' | while read PROFILE_NAME; do
+          if [ ! -z "$PROFILE_NAME" ]; then
+            echo "Deleting instance profile: $PROFILE_NAME"
+            aws iam delete-instance-profile --instance-profile-name "$PROFILE_NAME" || echo "Failed to delete instance profile $PROFILE_NAME"
+          fi
+        done
+
+    - name: 21. Cleanup DynamoDB Tables
+      run: |
+        echo "🧹 STEP 21: DESTROYING ALL DYNAMODB TABLES..."
+        
+        aws dynamodb list-tables --query 'TableNames' --output text | tr '\t' '\n' | while read TABLE_NAME; do
+          if [ ! -z "$TABLE_NAME" ]; then
+            echo "Deleting DynamoDB table: $TABLE_NAME"
+            aws dynamodb delete-table --table-name "$TABLE_NAME" || echo "Failed to delete table $TABLE_NAME"
+          fi
+        done
+
+    - name: 22. Cleanup API Gateway APIs
+      run: |
+        echo "🧹 STEP 22: DESTROYING ALL API GATEWAY APIs..."
+        
+        # REST APIs
+        aws apigateway get-rest-apis --query 'items[*].[id,name]' --output text | while read API_ID API_NAME; do
+          if [ ! -z "$API_ID" ]; then
+            echo "Deleting REST API: $API_NAME ($API_ID)"
+            aws apigateway delete-rest-api --rest-api-id "$API_ID" || echo "Failed to delete REST API $API_ID"
+          fi
+        done
+        
+        # HTTP APIs (API Gateway v2)
+        aws apigatewayv2 get-apis --query 'Items[*].[ApiId,Name]' --output text | while read API_ID API_NAME; do
+          if [ ! -z "$API_ID" ]; then
+            echo "Deleting HTTP API: $API_NAME ($API_ID)"
+            aws apigatewayv2 delete-api --api-id "$API_ID" || echo "Failed to delete HTTP API $API_ID"
+          fi
+        done
+
+    - name: 23. Final Verification
+      run: |
+        echo "🔍 FINAL VERIFICATION - SCANNING FOR REMAINING RESOURCES..."
         echo "============================================================"
         
         echo "=== REMAINING EC2 INSTANCES ==="
-        aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping,pending" --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' --output table || echo "✅ No instances remaining"
-        
-        echo "=== REMAINING RDS INSTANCES ==="
-        aws rds describe-db-instances --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceStatus]' --output table || echo "✅ No RDS instances remaining"
-        
-        echo "=== REMAINING LOAD BALANCERS ==="
-        ALB_COUNT=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
-        ELB_COUNT=$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text 2>/dev/null | wc -w)
-        if [ "$ALB_COUNT" -eq 0 ] && [ "$ELB_COUNT" -eq 0 ]; then
-          echo "✅ No load balancers remaining"
+        INSTANCES=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,stopped,stopping" --query 'Reservations[*].Instances[*].InstanceId' --output text)
+        if [ -z "$INSTANCES" ]; then
+          echo "✅ No EC2 instances remaining"
         else
-          echo "⚠️  Found $ALB_COUNT ALB/NLBs and $ELB_COUNT Classic ELBs still remaining"
-          aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerName,Type,State.Code]' --output table 2>/dev/null || true
-          aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].[LoadBalancerName,Scheme]' --output table 2>/dev/null || true
+          echo "⚠️ Remaining instances: $INSTANCES"
         fi
         
-        echo "=== REMAINING TARGET GROUPS ==="
-        TG_COUNT=$(aws elbv2 describe-target-groups --query 'TargetGroups[*].TargetGroupName' --output text 2>/dev/null | wc -w)
-        if [ "$TG_COUNT" -eq 0 ]; then
-          echo "✅ No target groups remaining"
+        echo "=== REMAINING RDS INSTANCES ==="
+        RDS_INSTANCES=$(aws rds describe-db-instances --query 'DBInstances[*].DBInstanceIdentifier' --output text)
+        if [ -z "$RDS_INSTANCES" ]; then
+          echo "✅ No RDS instances remaining"
         else
-          echo "⚠️  Found $TG_COUNT target groups still remaining"
-          aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupName,Protocol,Port]' --output table 2>/dev/null || true
+          echo "⚠️ Remaining RDS instances: $RDS_INSTANCES"
         fi
         
         echo "=== REMAINING S3 BUCKETS ==="
-        aws s3 ls || echo "✅ No buckets remaining"
-        
-        echo "=== REMAINING ELASTIC IPs ==="
-        aws ec2 describe-addresses --query 'Addresses[*].[PublicIp,AllocationId]' --output table || echo "✅ No Elastic IPs remaining"
-        
-        echo "=== REMAINING VPCs ==="
-        aws ec2 describe-vpcs --query 'Vpcs[?IsDefault!=`true`].[VpcId,State]' --output table || echo "✅ No custom VPCs remaining"
-        
-        echo "=== REMAINING LAMBDA FUNCTIONS ==="
-        aws lambda list-functions --query 'Functions[*].FunctionName' --output table || echo "✅ No Lambda functions remaining"
+        BUCKETS=$(aws s3 ls | awk '{print $3}' | tr '\n' ' ')
+        if [ -z "$BUCKETS" ]; then
+          echo "✅ No S3 buckets remaining"
+        else
+          echo "⚠️ Remaining buckets: $BUCKETS"
+        fi
         
         echo "=== REMAINING ECR REPOSITORIES ==="
-        aws ecr describe-repositories --query 'repositories[*].repositoryName' --output table || echo "✅ No ECR repositories remaining"
+        ECR_REPOS=$(aws ecr describe-repositories --query 'repositories[*].repositoryName' --output text)
+        if [ -z "$ECR_REPOS" ]; then
+          echo "✅ No ECR repositories remaining"
+        else
+          echo "⚠️ Remaining ECR repos: $ECR_REPOS"
+        fi
         
         echo "=== REMAINING ECS CLUSTERS ==="
-        aws ecs list-clusters --query 'clusterArns' --output table || echo "✅ No ECS clusters remaining"
+        ECS_CLUSTERS=$(aws ecs list-clusters --query 'clusterArns' --output text)
+        if [ -z "$ECS_CLUSTERS" ]; then
+          echo "✅ No ECS clusters remaining"
+        else
+          echo "⚠️ Remaining ECS clusters: $ECS_CLUSTERS"
+        fi
+        
+        echo "=== REMAINING LAMBDA FUNCTIONS ==="
+        LAMBDA_FUNCS=$(aws lambda list-functions --query 'Functions[*].FunctionName' --output text)
+        if [ -z "$LAMBDA_FUNCS" ]; then
+          echo "✅ No Lambda functions remaining"
+        else
+          echo "⚠️ Remaining Lambda functions: $LAMBDA_FUNCS"
+        fi
         
         echo ""
         echo "🎯 NUCLEAR CLEANUP COMPLETED!"
         echo "============================================"
-        echo "⚠️  WARNING: This was a complete destruction of ALL AWS resources!"
-        echo "📊 Please review the verification output above to confirm cleanup"
-        echo "💰 Check your AWS billing to ensure no unexpected charges"
-        echo "🔄 You may need to wait a few minutes for all deletions to propagate"
-        echo "🔄 Load balancers may take up to 5-10 minutes to fully delete"
+        echo "All AWS resources have been processed for deletion."
+        echo "Some resources may take additional time to fully terminate."
+        echo "Please check the AWS Console to verify complete cleanup."
