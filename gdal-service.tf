@@ -37,12 +37,20 @@ resource "aws_instance" "gdal_service" {
 
   user_data = <<-EOF
               #!/bin/bash
-              sudo yum update -y
-              sudo yum pixi global install gdal
-              sudo pixi global install libgdal-core
-              sudo pixi global install libgdal-arrow-parquet
-              # Install GDAL and other dependencies here
-              # For example, you can use the following command to install GDAL and its dependencies:
-              # Add any additional setup or scripts here
+              set -e
+              dnf update -y
+              dnf groupinstall "Development Tools" -y
+              curl -fsSL https://pixi.sh/install.sh | bash
+              chmod +x /home/ec2-user/.pixi/bin/pixi
+              PIXI_BIN="/home/ec2-user/.pixi/bin"
+              GDAL_BIN="/home/ec2-user/.pixi/envs/gdal/bin"
+              export PATH="$PIXI_BIN:$PATH"
+              $PIXI_BIN/pixi global install gdal libgdal-core
+              for bin in $GDAL_BIN/*; do
+                sudo ln -sf "$bin" /usr/local/bin/$(basename "$bin")
+              done  
               EOF
+              
+        
+           
 }
