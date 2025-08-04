@@ -9,25 +9,31 @@ resource "aws_instance" "wordpress" {
     Name = "WordPress Instance"
   }
 
-  user_data = <<-EOF
-              #!/bin/bash
-              sudo yum update -y
-              sudo systemctl enable ssh
-              sudo systemctl start ssh
-              sudo wget https://github.com/WordPress/WordPress/archive/master.zip
-              sudo unzip master -d /tmp/WordPress_Temp
-              mkdir -p /tmp/WordPress
-              cp -paf /tmp/WordPress_Temp/WordPress-master/* /tmp/WordPress
-              rm -rf /tmp/WordPress_Temp
-              rm -f master
-              cd /var/www/html
-              sudo chown -R www-data:www-data /var/www/html
-              sudo systemctl enable apache2
-              sudo systemctl start apache2
-              EOF
-              
-}
+  user_data=<<-EOF
+#!/bin/bash
+sudo dnf update -y
+sudo dnf install -y httpd php php-mysqli php-json php-fpm
+sudo systemctl start httpd
+sudo systemctl enable httpd
 
+cd /var/www/html
+sudo wget https://wordpress.org/latest.tar.gz
+sudo tar -xzf latest.tar.gz
+sudo mv wordpress/* .
+sudo chown -R apache:apache /var/www/html
+
+cat << EOM | sudo tee /etc/yum.repos.d/MariaDB.repo
+[mariadb]
+name = MariaDB
+baseurl = https://mirrors.gigenet.com/mariadb/yum/11.4/rhel/9/aarch64
+gpgkey = https://mirrors.gigenet.com/mariadb/yum/RPM-GPG-KEY-MariaDB
+gpgcheck = 1
+EOM
+
+sudo dnf install -y MariaDB-server MariaDB-client MariaDB-devel
+sudo systemctl restart httpd
+EOF
+}
 # Security Group for WordPress EC2 Instance
 resource "aws_security_group" "wordpress_instance" {
   name        = "wordpress-instance-sg"
